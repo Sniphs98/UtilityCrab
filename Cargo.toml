@@ -1,0 +1,41 @@
+[package]
+name = "utility_crab"
+version = "0.1.0"
+edition = "2021"
+description = "Kleines Windows-Tray-Tool: Text vorlesen und Text aus Bildern kopieren"
+
+[dependencies]
+tray-icon = "0.26"
+global-hotkey = "0.9"
+arboard = "3.7"
+ort = "2.0.0-rc.15"
+serde_json = "1"
+unicode-normalization = "0.1"
+whatlang = "0.16"
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+serde = { version = "1", features = ["derive"] }
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Graphics_Imaging",
+    "Media_Core",
+    "Media_Ocr",
+    "Media_Playback",
+    "Media_SpeechSynthesis",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
