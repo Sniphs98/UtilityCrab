@@ -33,6 +33,16 @@ cargo run --release
 
 Use the release build for everyday use. The neural voices are noticeably slower in debug builds.
 
+### Installer
+
+Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`).
+
+```powershell
+.\installer\build.ps1
+```
+
+This builds the release and writes `dist\UtilityCrab-Setup-<version>.exe`. The setup installs per user (no admin rights), adds a Start menu entry and can register UtilityCrab to start with Windows.
+
 ## Data
 
 Settings, the error log and downloaded models are stored in `%LOCALAPPDATA%\UtilityCrab`.

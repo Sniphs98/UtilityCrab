@@ -1,0 +1,57 @@
+# Baut bei jedem Push auf main das Windows-Setup und veröffentlicht es als GitHub-Release.
+# Version: <Version aus Cargo.toml>.<Build-Nummer>, z. B. 0.1.0.7
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Liest rust-toolchain.toml und installiert die passende Toolchain.
+      - name: Rust installieren
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Inno Setup installieren
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Version bestimmen
+        id: version
+        run: |
+          $base = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          "version=$base.${{ github.run_number }}" >> $env:GITHUB_OUTPUT
+
+      - name: Setup bauen
+        run: .\installer\build.ps1 -Version ${{ steps.version.outputs.version }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UtilityCrab-Setup-${{ steps.version.outputs.version }}
+          path: dist/*.exe
+
+      - name: Release erstellen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          gh release create "v$v" "dist\UtilityCrab-Setup-$v.exe" `
+            --target "${{ github.sha }}" `
+            --title "UtilityCrab $v" `
+            --generate-notes
