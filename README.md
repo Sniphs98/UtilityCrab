@@ -1,6 +1,16 @@
-# UtilityCrab 🦀
+<p align="center">
+  <img src="assets/icon.png" alt="UtilityCrab: Ferris the crab in a safety vest, holding a wrench" width="180">
+</p>
 
-A small Windows tray tool written in Rust that reads selected text aloud, copies text from images and converts or shrinks images.
+<h1 align="center">UtilityCrab</h1>
+
+<p align="center">
+  A small Windows tray tool written in Rust that reads selected text aloud, copies text from images and converts or shrinks images.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Sniphs98/UtilityCrab/releases/latest"><b>Download the latest version</b></a>
+</p>
 
 ## Features
 
