@@ -252,35 +252,8 @@ impl eframe::App for Popup {
     }
 }
 
-/// Systemschrift (Segoe UI, Titel in Semibold) und ein ruhiger Tooltip-Stil.
+/// Ruhiger Tooltip-Stil (die Schrift setzt schon `apply_theme`).
 fn style(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    let windir = std::env::var_os("WINDIR").unwrap_or_else(|| r"C:\Windows".into());
-    let fonts_dir = std::path::PathBuf::from(windir).join("Fonts");
-    let mut semibold = Vec::new();
-    for (name, file) in [("segoe", "segoeui.ttf"), ("segoe-semibold", "seguisb.ttf")] {
-        if let Ok(bytes) = std::fs::read(fonts_dir.join(file)) {
-            fonts
-                .font_data
-                .insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
-            if name == "segoe" {
-                fonts
-                    .families
-                    .entry(egui::FontFamily::Proportional)
-                    .or_default()
-                    .insert(0, name.into());
-            } else {
-                semibold.push(name.to_string());
-            }
-        }
-    }
-    // Fehlt Semibold, wird es normal; danach die übrigen Schriften als Ersatz für Sonderzeichen.
-    semibold.extend(fonts.families[&egui::FontFamily::Proportional].iter().cloned());
-    fonts
-        .families
-        .insert(egui::FontFamily::Name(theme::SEMIBOLD.into()), semibold);
-    ctx.set_fonts(fonts);
-
     ctx.all_styles_mut(|style| {
         style.interaction.tooltip_delay = 0.15;
         style.interaction.show_tooltips_only_when_still = false;

@@ -13,6 +13,7 @@ mod settings_ui;
 mod shell_menu;
 mod toast;
 mod tts;
+mod ui_kit;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -68,7 +69,7 @@ static OCR_HOTKEY: AtomicU32 = AtomicU32::new(0);
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some(SETTINGS_ARG) => return settings_ui::run(),
+        Some(SETTINGS_ARG) => return settings_ui::run(args.get(1).map(String::as_str)),
         Some(convert::CLI_ARG) => return convert::batch::run(&args[1..]),
         Some(popup::remote::ARG) => return popup::remote::serve(),
         Some(popup::demo::ARG) => return popup::demo::run(args.get(1).map(String::as_str)),
