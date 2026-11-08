@@ -25,6 +25,8 @@ pub struct Settings {
     pub context_menu: bool,
     /// Wie fertige Konvertierungen gemeldet werden.
     pub notify: Notify,
+    /// Täglich nach Updates suchen (nur installierte Release-Versionen).
+    pub auto_update: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -54,6 +56,7 @@ impl Default for Settings {
             pronunciations: Vec::new(),
             context_menu: true,
             notify: Notify::Popup,
+            auto_update: true,
         }
     }
 }

@@ -13,6 +13,7 @@ use global_hotkey::hotkey::HotKey;
 use crate::icon;
 use crate::settings::{hotkey_label, Notify, Pronunciation, Settings};
 use crate::tts::{self, Package, VoiceInfo};
+use crate::update;
 use crate::ui_kit::{
     self, danger_button, keycaps, nav_item, page_header, primary_button, regular, section, semibold, toggle, NavIcon,
     SIDEBAR_BG, SMALL_SIZE, TEXT, TEXT_FAINT, TEXT_WEAK,
@@ -71,10 +72,18 @@ enum Tab {
     Pronunciation,
     Hotkeys,
     Convert,
+    About,
 }
 
 impl Tab {
-    const ALL: [Tab; 5] = [Tab::Voice, Tab::Models, Tab::Pronunciation, Tab::Hotkeys, Tab::Convert];
+    const ALL: [Tab; 6] = [
+        Tab::Voice,
+        Tab::Models,
+        Tab::Pronunciation,
+        Tab::Hotkeys,
+        Tab::Convert,
+        Tab::About,
+    ];
 
     fn id(self) -> &'static str {
         match self {
@@ -83,6 +92,7 @@ impl Tab {
             Tab::Pronunciation => "aussprache",
             Tab::Hotkeys => "tasten",
             Tab::Convert => "konvertieren",
+            Tab::About => "info",
         }
     }
 
@@ -93,6 +103,7 @@ impl Tab {
             Tab::Pronunciation => "Aussprache",
             Tab::Hotkeys => "Tastenkürzel",
             Tab::Convert => "Konvertieren",
+            Tab::About => "Info & Updates",
         }
     }
 
@@ -103,6 +114,7 @@ impl Tab {
             Tab::Pronunciation => (NavIcon::Text, Color32::from_rgb(0x22, 0xA5, 0x5B)),
             Tab::Hotkeys => (NavIcon::Keyboard, Color32::from_rgb(0x6B, 0x72, 0x80)),
             Tab::Convert => (NavIcon::Convert, ui_kit::ACCENT),
+            Tab::About => (NavIcon::Info, Color32::from_rgb(0x0E, 0x9F, 0xB5)),
         }
     }
 }
@@ -116,6 +128,16 @@ enum HotkeyTarget {
 enum DownloadState {
     Running(f32),
     Done,
+    Failed(String),
+}
+
+/// Ergebnis der Update-Suche auf der Info-Seite.
+#[derive(Clone)]
+enum UpdateState {
+    Idle,
+    Checking,
+    Current,
+    Available(update::Release),
     Failed(String),
 }
 
@@ -135,6 +157,7 @@ struct SettingsApp {
     capture: Option<HotkeyTarget>,
     message: Option<String>,
     crab: egui::TextureHandle,
+    update: Arc<Mutex<UpdateState>>,
 }
 
 impl SettingsApp {
@@ -158,6 +181,7 @@ impl SettingsApp {
             capture: None,
             message: None,
             crab,
+            update: Arc::new(Mutex::new(UpdateState::Idle)),
         };
         app.refresh_catalog();
         app
@@ -234,6 +258,7 @@ impl eframe::App for SettingsApp {
                     Tab::Pronunciation => self.pronunciation_tab(ui),
                     Tab::Hotkeys => self.hotkeys_tab(ui),
                     Tab::Convert => self.convert_tab(ui),
+                    Tab::About => self.about_tab(ui),
                 }
             });
         });
@@ -246,7 +271,9 @@ impl eframe::App for SettingsApp {
         }
 
         // Fortschritt und Abspielknopf aktuell halten.
-        let busy = !self.downloads.lock().unwrap().is_empty() || self.speaker.is_speaking();
+        let busy = !self.downloads.lock().unwrap().is_empty()
+            || self.speaker.is_speaking()
+            || matches!(*self.update.lock().unwrap(), UpdateState::Checking);
         if busy {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
@@ -673,6 +700,94 @@ impl SettingsApp {
                 });
             },
         );
+    }
+}
+
+impl SettingsApp {
+    fn about_tab(&mut self, ui: &mut egui::Ui) {
+        page_header(ui, "Info & Updates", "Version und Aktualisierungen.");
+
+        let state = self.update.lock().unwrap().clone();
+        let mut check = false;
+        let mut install = None;
+        section(ui, None, None, |g| {
+            g.row("Version", None, |ui| {
+                ui.label(RichText::new(update::display_version()).color(TEXT_WEAK));
+            });
+            g.row(
+                "Automatisch nach Updates suchen",
+                Some("Einmal täglich. Ein Update wird erst nach deiner Bestätigung installiert."),
+                |ui| {
+                    toggle(ui, &mut self.settings.auto_update);
+                },
+            );
+            let (label, description): (&str, Option<String>) = match &state {
+                UpdateState::Idle => ("Nach Updates suchen", None),
+                UpdateState::Checking => ("Suche läuft …", None),
+                UpdateState::Current => ("UtilityCrab ist aktuell", None),
+                UpdateState::Available(r) => ("Update verfügbar", Some(format!("Version {}", r.version))),
+                UpdateState::Failed(e) => ("Suche fehlgeschlagen", Some(e.clone())),
+            };
+            g.row(label, description.as_deref(), |ui| match &state {
+                UpdateState::Checking => {
+                    ui.add(egui::Spinner::new());
+                }
+                UpdateState::Available(release) => {
+                    if ui.add(primary_button("Jetzt aktualisieren")).clicked() {
+                        install = Some(release.clone());
+                    }
+                    if !release.page_url.is_empty() && ui.button("Änderungen").clicked() {
+                        let _ = std::process::Command::new("explorer").arg(&release.page_url).spawn();
+                    }
+                }
+                _ => {
+                    if ui.button("Jetzt suchen").clicked() {
+                        check = true;
+                    }
+                }
+            });
+        });
+        if update::release_version().is_none() {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "Dies ist ein lokaler Build: Er sucht nicht automatisch nach Updates. \
+                             Installierte Versionen aus GitHub-Releases tun das.",
+                        )
+                        .font(regular(SMALL_SIZE))
+                        .color(TEXT_FAINT),
+                    )
+                    .wrap(),
+                );
+            });
+        }
+
+        if check {
+            *self.update.lock().unwrap() = UpdateState::Checking;
+            let state = self.update.clone();
+            let ctx = ui.ctx().clone();
+            thread::spawn(move || {
+                let result = match update::check() {
+                    Ok(Some(release)) => UpdateState::Available(release),
+                    Ok(None) => UpdateState::Current,
+                    Err(e) => UpdateState::Failed(e),
+                };
+                *state.lock().unwrap() = result;
+                ctx.request_repaint();
+            });
+        }
+        if let Some(release) = install {
+            if let Ok(exe) = std::env::current_exe() {
+                let spawned = std::process::Command::new(exe)
+                    .args([update::INSTALL_ARG, &release.setup_url, &release.version])
+                    .spawn();
+                if let Err(e) = spawned {
+                    self.message = Some(format!("Update konnte nicht gestartet werden: {e}"));
+                }
+            }
+        }
     }
 }
 

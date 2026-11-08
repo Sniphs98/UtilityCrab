@@ -20,6 +20,7 @@ A small Windows tray tool written in Rust that reads selected text aloud, copies
 - **Automatic language detection** per sentence. Piper and the Windows voices switch to an installed voice of the detected language.
 - **Pronunciation dictionary** for words a voice gets wrong.
 - **Settings window** to pick voice and speed, download or delete models, and change the hotkeys.
+- **Updates:** installed versions check GitHub Releases once a day and offer a new version in a popup. One click downloads the setup, installs it silently and restarts UtilityCrab. Turn it off under **Info & Updates** in the settings, or check by hand from the tray menu (**Nach Updates suchen**).
 
 ## Default hotkeys
 
@@ -48,7 +49,11 @@ Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSo
 .\installer\build.ps1
 ```
 
-This builds the release and writes `dist\UtilityCrab-Setup-<version>.exe`. The setup installs per user (no admin rights), adds a Start menu entry and can register UtilityCrab to start with Windows.
+This builds the release and writes `dist\UtilityCrab-Setup-<version>.exe`. The setup installs per user (no admin rights), adds a Start menu entry and can register UtilityCrab to start with Windows. The version is also built into the exe (`UTILITYCRAB_VERSION`) for the update check; plain `cargo run` builds have none and don't check automatically.
+
+### Releases
+
+Every push to `main` builds the setup on GitHub Actions and publishes it as release `v<Cargo version>.<run number>`, for example `v0.1.0.7`. Installed copies pick it up through the update check.
 
 ## Popups
 

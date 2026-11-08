@@ -60,6 +60,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 ; Untermenü „Konvertieren“ im Explorer-Kontextmenü von Bildern eintragen (abschaltbar in den Einstellungen).
 Filename: "{app}\{#AppExe}"; Parameters: "--kontextmenue-einrichten"; Flags: runhidden waituntilterminated
 Filename: "{app}\{#AppExe}"; Description: "UtilityCrab jetzt starten"; Flags: nowait postinstall skipifsilent
+; Nach einem Update aus der App heraus (stilles Setup) automatisch wieder starten.
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: WizardSilent
 
 [UninstallRun]
 Filename: "taskkill.exe"; Parameters: "/F /IM {#AppExe}"; Flags: runhidden; RunOnceId: "KillApp"

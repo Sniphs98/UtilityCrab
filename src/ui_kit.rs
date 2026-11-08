@@ -351,6 +351,7 @@ pub enum NavIcon {
     Text,
     Keyboard,
     Convert,
+    Info,
 }
 
 /// Eintrag in der Seitenleiste. Gibt `true` zurück, wenn er angeklickt wurde.
@@ -412,6 +413,10 @@ fn nav_glyph(painter: &Painter, rect: Rect, icon: NavIcon) {
                 painter.circle_filled(c + vec2(x, -1.5), 0.8, white);
             }
             painter.line_segment([c + vec2(-3.0, 2.0), c + vec2(3.0, 2.0)], Stroke::new(1.2, white));
+        }
+        NavIcon::Info => {
+            painter.circle_filled(c + vec2(0.0, -4.5), 1.4, white);
+            painter.line_segment([c + vec2(0.0, -1.5), c + vec2(0.0, 5.5)], Stroke::new(1.8, white));
         }
         NavIcon::Convert => {
             painter.line_segment([c + vec2(-5.0, -3.0), c + vec2(5.0, -3.0)], stroke);
