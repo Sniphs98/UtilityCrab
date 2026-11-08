@@ -2,12 +2,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod clipboard;
+mod convert;
+mod crab_pixels;
 mod download;
 mod icon;
 mod ocr;
+mod popup;
 mod settings;
 mod settings_ui;
+mod shell_menu;
+mod toast;
 mod tts;
+mod ui_kit;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -44,6 +50,8 @@ enum Command {
     /// Bild aus der Zwischenablage erkennen und den Text kopieren.
     OcrClipboard,
     OpenSettings,
+    /// Konverter-Fenster öffnen.
+    OpenConverter,
     /// Die Einstellungen wurden im Dialog geändert.
     SettingsChanged,
     /// Fehlerprotokoll im Editor öffnen.
@@ -59,9 +67,18 @@ static SPEAK_HOTKEY: AtomicU32 = AtomicU32::new(0);
 static OCR_HOTKEY: AtomicU32 = AtomicU32::new(0);
 
 fn main() {
-    if std::env::args().any(|a| a == SETTINGS_ARG) {
-        settings_ui::run();
-        return;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some(SETTINGS_ARG) => return settings_ui::run(args.get(1).map(String::as_str)),
+        Some(convert::CLI_ARG) => return convert::batch::run(&args[1..]),
+        Some(popup::remote::ARG) => return popup::remote::serve(),
+        Some(popup::demo::ARG) => return popup::demo::run(args.get(1).map(String::as_str)),
+        Some(shell_menu::INSTALL_ARG) => return report(shell_menu::sync(Settings::load().context_menu)),
+        Some(shell_menu::UNINSTALL_ARG) => {
+            toast::unregister();
+            return report(shell_menu::uninstall());
+        }
+        _ => {}
     }
 
     let main_thread = unsafe { GetCurrentThreadId() };
@@ -94,6 +111,7 @@ fn main() {
     let speak_item = MenuItem::new("", true, None);
     let snip_item = MenuItem::new("", true, None);
     let clip_item = MenuItem::new("Text aus Bild in Zwischenablage kopieren", true, None);
+    let convert_item = MenuItem::new("Bilder konvertieren / verkleinern …", true, None);
     let settings_item = MenuItem::new("Einstellungen …", true, None);
     let log_item = MenuItem::new("Fehlerprotokoll öffnen", true, None);
     let quit_item = MenuItem::new("Beenden", true, None);
@@ -103,6 +121,7 @@ fn main() {
         &speak_item,
         &snip_item,
         &clip_item,
+        &convert_item,
         &PredefinedMenuItem::separator(),
         &settings_item,
         &log_item,
@@ -114,6 +133,7 @@ fn main() {
         (speak_item.id().clone(), Command::SpeakSelection),
         (snip_item.id().clone(), Command::OcrSnip),
         (clip_item.id().clone(), Command::OcrClipboard),
+        (convert_item.id().clone(), Command::OpenConverter),
         (settings_item.id().clone(), Command::OpenSettings),
         (log_item.id().clone(), Command::OpenLog),
         (quit_item.id().clone(), Command::Quit),
@@ -207,7 +227,10 @@ fn update_labels(settings: &Settings, tray: &TrayIcon, speak_item: &MenuItem, sn
 fn worker_loop(rx: mpsc::Receiver<Command>, main_thread: u32) {
     let mut speaker = tts::Speaker::new();
     let mut settings_window: Option<Child> = None;
-    tts::preload(&Settings::load());
+    let settings = Settings::load();
+    tts::preload(&settings);
+    // Bei jedem Start eintragen, damit der Programmpfad nach einem Update stimmt.
+    report(shell_menu::sync(settings.context_menu));
 
     for cmd in rx {
         let result = match cmd {
@@ -215,9 +238,11 @@ fn worker_loop(rx: mpsc::Receiver<Command>, main_thread: u32) {
             Command::OcrSnip => spawn_ocr(ocr::snip_to_clipboard),
             Command::OcrClipboard => spawn_ocr(ocr::clipboard_image_to_clipboard),
             Command::OpenSettings => open_settings(&mut settings_window),
+            Command::OpenConverter => spawn_self(&[convert::CLI_ARG, "fenster"]).map(|_| ()),
             Command::SettingsChanged => {
-                tts::preload(&Settings::load());
-                Ok(())
+                let settings = Settings::load();
+                tts::preload(&settings);
+                shell_menu::sync(settings.context_menu)
             }
             Command::OpenLog => open_log(),
             Command::Quit => {
@@ -248,24 +273,33 @@ fn open_settings(window: &mut Option<Child>) -> Result<(), String> {
             return Ok(());
         }
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let child = std::process::Command::new(exe)
-        .arg(SETTINGS_ARG)
-        .spawn()
-        .map_err(|e| format!("Einstellungen konnten nicht geöffnet werden: {e}"))?;
-    *window = Some(child);
+    *window = Some(spawn_self(&[SETTINGS_ARG])?);
     Ok(())
 }
 
+/// Startet dieses Programm noch einmal mit anderen Argumenten (Fenster laufen als eigene Prozesse).
+fn spawn_self(args: &[&str]) -> Result<Child, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    std::process::Command::new(exe)
+        .args(args)
+        .spawn()
+        .map_err(|e| format!("Fenster konnte nicht geöffnet werden: {e}"))
+}
+
 /// Startet eine Texterkennung in eigenem Thread, weil dabei auf den Benutzer gewartet wird.
-fn spawn_ocr(job: fn() -> Result<(), String>) -> Result<(), String> {
+fn spawn_ocr(job: fn() -> Result<String, String>) -> Result<(), String> {
     if OCR_BUSY.swap(true, Ordering::SeqCst) {
         return Err("Texterkennung läuft bereits".into());
     }
     thread::spawn(move || {
         let result = job();
         OCR_BUSY.store(false, Ordering::SeqCst);
-        report(result);
+        if let Err(e) = &result {
+            log_error(e);
+        }
+        if let Some(notice) = ocr::notice(&result) {
+            popup::remote::notify(notice);
+        }
     });
     Ok(())
 }

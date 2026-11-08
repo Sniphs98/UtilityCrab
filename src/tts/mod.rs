@@ -25,6 +25,7 @@ pub struct Package {
 }
 
 /// Eine sofort benutzbare Stimme.
+#[derive(Clone)]
 pub struct VoiceInfo {
     pub id: String,
     pub name: String,
