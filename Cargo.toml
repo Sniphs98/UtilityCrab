@@ -14,6 +14,11 @@ unicode-normalization = "0.1"
 whatlang = "0.16"
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 serde = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif", "tiff", "ico"] }
+oxipng = { version = "10", default-features = false, features = ["parallel"] }
+webp = { version = "0.3", default-features = false }
+winreg = "0.56"
+rayon = "1"
 
 [dependencies.windows]
 version = "0.62"
@@ -21,6 +26,12 @@ features = [
     "Foundation",
     "Foundation_Collections",
     "Graphics_Imaging",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Data_Xml_Dom",
+    "UI_Notifications",
     "Media_Core",
     "Media_Ocr",
     "Media_Playback",
@@ -39,3 +50,6 @@ features = [
 opt-level = "z"
 lto = true
 strip = true
+
+[build-dependencies]
+winresource = "0.1"

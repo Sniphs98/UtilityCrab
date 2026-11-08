@@ -1,11 +1,18 @@
 # UtilityCrab 🦀
 
-A small Windows tray tool written in Rust that reads selected text aloud and copies text from images.
+A small Windows tray tool written in Rust that reads selected text aloud, copies text from images and converts or shrinks images.
 
 ## Features
 
 - **Read aloud:** select text anywhere and press a hotkey. Speech starts after the first sentence is ready, and pressing the hotkey again stops it.
 - **Text from screenshots (OCR):** snip a region of the screen and the recognized text lands in your clipboard. Uses the built-in Windows OCR.
+- **Image converter:** right-click an image in Explorer → **Konvertieren** → convert it to PNG, JPG, WebP or ICO, or **Verkleinern** (shrink) it. Several selected files are handled in one go. Afterwards the new files are on the clipboard (paste them with Ctrl+V into a folder, chat or e-mail) and a notification shows the size change; longer jobs show a progress bar in the notification. **Weitere Optionen …** opens a window with every setting:
+  - target format (PNG, JPG, WebP, BMP, GIF, TIFF, ICO), quality, resizing by longest edge or percent
+  - a maximum file size in KB: quality and, if needed, resolution are lowered until the file fits
+  - presets for e-mail, websites and "under 1 MB"
+  - drag & drop of files and folders; the window can also be opened from the tray menu
+
+  Reads PNG, JPG, WebP, BMP, GIF, TIFF and ICO, plus HEIC and AVIF through Windows codecs (install *HEIF Image Extensions* or *AV1 Video Extension* from the Microsoft Store). Originals are never changed. PNGs are optimized losslessly with [oxipng](https://github.com/shssoichiro/oxipng). Metadata such as GPS position is removed. On Windows 11 the menu is under **Show more options** (or Shift+right-click).
 - **Multiple voice engines**, all running locally:
   - **Windows voices:** the voices built into Windows, no download needed.
   - **[Supertonic 3](https://huggingface.co/Supertone/supertonic-3):** natural-sounding neural TTS with 31 languages and 10 voices (~400 MB).

@@ -13,12 +13,12 @@ use crate::icon;
 use crate::settings::{hotkey_label, Pronunciation, Settings};
 use crate::tts::{self, Package, VoiceInfo};
 
-const ACCENT: Color32 = Color32::from_rgb(0xE8, 0x6A, 0x1C);
+pub const ACCENT: Color32 = Color32::from_rgb(0xE8, 0x6A, 0x1C);
 
 // Dunkelgraues Farbschema
 const NAV_BG: Color32 = Color32::from_rgb(0x1F, 0x20, 0x23);
-const PAGE_BG: Color32 = Color32::from_rgb(0x2B, 0x2D, 0x31);
-const CARD_BG: Color32 = Color32::from_rgb(0x34, 0x36, 0x3B);
+pub const PAGE_BG: Color32 = Color32::from_rgb(0x2B, 0x2D, 0x31);
+pub const CARD_BG: Color32 = Color32::from_rgb(0x34, 0x36, 0x3B);
 const FIELD_BG: Color32 = Color32::from_rgb(0x1E, 0x1F, 0x22);
 const TEXT: Color32 = Color32::from_rgb(0xE3, 0xE5, 0xE8);
 
@@ -50,6 +50,34 @@ fn gray_visuals() -> egui::Visuals {
     v
 }
 
+/// Gemeinsames Aussehen aller Fenster (Einstellungen, Konverter).
+pub fn apply_theme(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.all_styles_mut(|style| {
+        style.visuals = gray_visuals();
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 5.0);
+        style.spacing.interact_size.y = 28.0;
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Heading, egui::FontId::proportional(24.0));
+    });
+}
+
+pub fn window_icon() -> egui::IconData {
+    egui::IconData {
+        rgba: icon::crab_rgba(),
+        width: icon::SIZE,
+        height: icon::SIZE,
+    }
+}
+
 pub fn run() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -79,6 +107,7 @@ enum Tab {
     Models,
     Pronunciation,
     Hotkeys,
+    Convert,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -112,23 +141,7 @@ struct SettingsApp {
 
 impl SettingsApp {
     fn new(cc: &eframe::CreationContext) -> Self {
-        cc.egui_ctx.set_theme(egui::Theme::Dark);
-        cc.egui_ctx.all_styles_mut(|style| {
-            style.visuals = gray_visuals();
-            style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-            style.spacing.button_padding = egui::vec2(12.0, 5.0);
-            style.spacing.interact_size.y = 28.0;
-            style
-                .text_styles
-                .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Heading, egui::FontId::proportional(24.0));
-        });
-
+        apply_theme(&cc.egui_ctx);
         let settings = Settings::load();
         let mut app = Self {
             tab: Tab::Voice,
@@ -208,6 +221,7 @@ impl eframe::App for SettingsApp {
                     Tab::Models => self.models_tab(ui),
                     Tab::Pronunciation => self.pronunciation_tab(ui),
                     Tab::Hotkeys => self.hotkeys_tab(ui),
+                    Tab::Convert => self.convert_tab(ui),
                 }
                 if let Some(message) = &self.message {
                     ui.add_space(12.0);
@@ -243,6 +257,7 @@ impl SettingsApp {
             (Tab::Models, "Modelle"),
             (Tab::Pronunciation, "Aussprache"),
             (Tab::Hotkeys, "Tastenkürzel"),
+            (Tab::Convert, "Konvertieren"),
         ] {
             let selected = self.tab == tab;
             let text = RichText::new(label).size(16.0);
@@ -585,6 +600,39 @@ impl SettingsApp {
     }
 }
 
+impl SettingsApp {
+    fn convert_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Konvertieren");
+        ui.label(RichText::new("Bilder in andere Formate umwandeln und Dateien verkleinern.").weak());
+        ui.add_space(12.0);
+
+        ui.checkbox(&mut self.settings.context_menu, "Im Explorer-Kontextmenü anzeigen");
+        ui.label(
+            RichText::new(
+                "Rechtsklick auf ein Bild → „Konvertieren“ → z. B. „In PNG umwandeln“ oder „Verkleinern“.                  Unter Windows 11 steht das Menü unter „Weitere Optionen anzeigen“ (oder Umschalt+Rechtsklick).",
+            )
+            .weak(),
+        );
+        ui.add_space(12.0);
+        if ui.add(accent_button("Konverter öffnen")).clicked() {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe)
+                    .args([crate::convert::CLI_ARG, "fenster"])
+                    .spawn();
+            }
+        }
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new(
+                "Lesen: PNG, JPG, WebP, BMP, GIF, TIFF, ICO sowie HEIC und AVIF                  (dafür die „HEIF-Bilderweiterungen“ bzw. „AV1 Video Extension“ aus dem Microsoft Store).
+                 Schreiben: PNG, JPG, WebP, BMP, GIF, TIFF, ICO.",
+            )
+            .small()
+            .weak(),
+        );
+    }
+}
+
 /// Liest eine gedrückte Tastenkombination. `Err(None)` = abgebrochen.
 fn capture_hotkey(ui: &egui::Ui) -> Option<Result<String, Option<String>>> {
     use egui::Key;
@@ -637,6 +685,6 @@ fn capture_hotkey(ui: &egui::Ui) -> Option<Result<String, Option<String>>> {
     Some(Ok(hotkey))
 }
 
-fn accent_button(text: &str) -> egui::Button<'_> {
+pub fn accent_button(text: &str) -> egui::Button<'_> {
     egui::Button::new(RichText::new(text).color(Color32::WHITE)).fill(ACCENT)
 }
