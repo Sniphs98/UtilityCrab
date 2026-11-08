@@ -134,8 +134,10 @@ fn notifier() -> Result<ToastNotifier, String> {
 
 /// Name und Icon, die Windows im Toast und in den Benachrichtigungseinstellungen zeigt.
 fn register() -> Result<(), String> {
-    let icon = crate::data_dir().join("krabbe.png");
+    // Versionsnummer im Namen: Nach einem Icon-Wechsel wird die Datei neu geschrieben.
+    let icon = crate::data_dir().join("app-icon-2.png");
     if !icon.exists() {
+        let _ = std::fs::remove_file(crate::data_dir().join("krabbe.png"));
         let _ = std::fs::create_dir_all(crate::data_dir());
         let size = 128;
         image::save_buffer(

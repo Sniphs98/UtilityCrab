@@ -57,4 +57,5 @@ lto = true
 strip = true
 
 [build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
 winresource = "0.1"
