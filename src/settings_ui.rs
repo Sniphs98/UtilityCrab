@@ -10,7 +10,7 @@ use eframe::egui::{self, Color32, RichText};
 use global_hotkey::hotkey::HotKey;
 
 use crate::icon;
-use crate::settings::{hotkey_label, Pronunciation, Settings};
+use crate::settings::{hotkey_label, Notify, Pronunciation, Settings};
 use crate::tts::{self, Package, VoiceInfo};
 
 pub const ACCENT: Color32 = Color32::from_rgb(0xE8, 0x6A, 0x1C);
@@ -609,9 +609,22 @@ impl SettingsApp {
         ui.checkbox(&mut self.settings.context_menu, "Im Explorer-Kontextmenü anzeigen");
         ui.label(
             RichText::new(
-                "Rechtsklick auf ein Bild → „Konvertieren“ → z. B. „In PNG umwandeln“ oder „Verkleinern“.                  Unter Windows 11 steht das Menü unter „Weitere Optionen anzeigen“ (oder Umschalt+Rechtsklick).",
+                "Rechtsklick auf ein Bild, dann „Konvertieren“ und z. B. „In PNG umwandeln“ oder „Verkleinern“. \
+                 Unter Windows 11 steht das Menü unter „Weitere Optionen anzeigen“ (oder Umschalt+Rechtsklick).",
             )
             .weak(),
+        );
+        ui.add_space(12.0);
+        ui.label(RichText::new("Wenn eine Konvertierung fertig ist").strong());
+        ui.radio_value(
+            &mut self.settings.notify,
+            Notify::Popup,
+            "Kleines Fenster unten in der Mitte (mit Fortschritt in %)",
+        );
+        ui.radio_value(
+            &mut self.settings.notify,
+            Notify::Windows,
+            "Windows-Benachrichtigung unten rechts (bleibt im Benachrichtigungscenter)",
         );
         ui.add_space(12.0);
         if ui.add(accent_button("Konverter öffnen")).clicked() {
@@ -624,10 +637,10 @@ impl SettingsApp {
         ui.add_space(12.0);
         ui.label(
             RichText::new(
-                "Lesen: PNG, JPG, WebP, BMP, GIF, TIFF, ICO sowie HEIC und AVIF                  (dafür die „HEIF-Bilderweiterungen“ bzw. „AV1 Video Extension“ aus dem Microsoft Store).
+                "Lesen: PNG, JPG, WebP, BMP, GIF, TIFF, ICO sowie HEIC und AVIF \
+                 (dafür die „HEIF-Bilderweiterungen“ bzw. „AV1 Video Extension“ aus dem Microsoft Store).\n\
                  Schreiben: PNG, JPG, WebP, BMP, GIF, TIFF, ICO.",
             )
-            .small()
             .weak(),
         );
     }

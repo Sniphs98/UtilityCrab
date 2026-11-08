@@ -6,17 +6,19 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::thread;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 use rayon::prelude::*;
 use windows::core::HSTRING;
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
 
-use super::{convert_file, describe, size_change, Format, Options, Outcome};
-use crate::toast;
+use super::{convert_file, notice, Format, Options, Outcome};
+use crate::settings::{Notify, Settings};
+use crate::{popup, toast};
 
 /// Was mit den Dateien passieren soll.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,8 +74,8 @@ pub fn run(args: &[String]) {
         let files = queue.drain();
         match job {
             Job::Dialog => super::ui::run(files, Some(queue.clone())),
-            Job::ConvertTo(format) => process(&files, &Options::convert_to(format)),
-            Job::Shrink => process(&files, &Options::shrink()),
+            Job::ConvertTo(format) => process(&files, &Options::convert_to(format), job),
+            Job::Shrink => process(&files, &Options::shrink(), job),
         }
         drop(lock);
         // Wer sich nach dem letzten Abholen eingereiht hat, sah die Sperre noch belegt –
@@ -84,110 +86,91 @@ pub fn run(args: &[String]) {
     }
 }
 
-/// Wandelt die Dateien parallel um, legt die Ergebnisse in die Zwischenablage und meldet
-/// sich per Toast. Dauert es länger als eine Sekunde, läuft vorher ein Fortschrittsbalken mit.
-fn process(files: &[PathBuf], options: &Options) {
+/// Wandelt die Dateien parallel um, legt die Ergebnisse in die Zwischenablage und zeigt
+/// Fortschritt und Ergebnis – als eigenes Popup unten mittig oder als Windows-Benachrichtigung.
+fn process(files: &[PathBuf], options: &Options, job: Job) {
     if files.is_empty() {
         return;
     }
-    // Fortschritt je Datei in Promille.
-    let progress: Vec<AtomicU32> = files.iter().map(|_| AtomicU32::new(0)).collect();
-    let finished = AtomicBool::new(false);
-    let tag = format!("konvertieren-{}", std::process::id());
+    let initial = notice::running(job, files, &vec![0.0; files.len()]);
 
-    let results: Vec<Result<Outcome, String>> = thread::scope(|scope| {
-        let worker = scope.spawn(|| {
-            let results = files
-                .par_iter()
-                .zip(&progress)
-                .map(|(file, slot)| convert_file(file, options, &|p| slot.store((p * 1000.0) as u32, Ordering::Relaxed)))
-                .collect();
-            finished.store(true, Ordering::SeqCst);
-            results
+    if Settings::load().notify == Notify::Popup {
+        let result = popup::run(initial, |handle| {
+            let done = work(files, options, job, &mut |n| handle.set(n.clone()));
+            handle.set(done);
         });
-
-        let started = Instant::now();
-        let mut toast = None;
-        while !finished.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(100));
-            if started.elapsed() < Duration::from_secs(1) {
-                continue;
-            }
-            let done: Vec<u32> = progress.iter().map(|p| p.load(Ordering::Relaxed)).collect();
-            let fraction = done.iter().sum::<u32>() as f32 / (1000 * files.len()) as f32;
-            let status = if files.len() == 1 {
-                file_name(&files[0])
-            } else {
-                let complete = done.iter().filter(|&&p| p >= 1000).count();
-                format!("{complete} von {} Bildern", files.len())
-            };
-            if toast.is_none() {
-                let title = if files.len() == 1 { "Bild wird konvertiert …" } else { "Bilder werden konvertiert …" };
-                // Ein fehlgeschlagener Toast wird nicht jedes Mal neu versucht.
-                toast = Some(toast::progress(&tag, title).ok());
-            }
-            if let Some(Some(toast)) = toast.as_mut() {
-                toast.update(fraction, &status);
-            }
-            thread::sleep(Duration::from_millis(150));
-        }
-        worker.join().expect("Konvertierung abgestürzt")
-    });
-
-    let mut written = Vec::new();
-    let (mut before, mut after) = (0, 0);
-    let mut problems = Vec::new();
-    for (file, result) in files.iter().zip(&results) {
         match result {
-            Ok(Outcome::Written { path, before: b, after: a }) => {
-                written.push(path.clone());
-                before += b;
-                after += a;
-            }
-            Ok(outcome @ Outcome::AlreadySmall { .. }) => problems.push(format!("{}: {}", file_name(file), describe(outcome))),
-            Err(e) => {
-                crate::log_error(e);
-                problems.push(e.clone());
+            Ok(()) => return,
+            // Kein Fenster möglich: Ergebnis (die Arbeit ist schon fertig) als Toast zeigen.
+            Err((e, last)) => {
+                crate::log_error(&e);
+                finish_with_toast(&mut toast::NoticeSink::new(&toast_tag()), &last);
             }
         }
+        return;
     }
 
-    let copied = !written.is_empty() && super::copy_to_clipboard(&written).is_ok();
-    let title = match (written.len(), files.len()) {
-        (0, 1) => "Nicht konvertiert".to_string(),
-        (0, _) => "Keine Bilder konvertiert".to_string(),
-        (1, 1) => format!("Fertig: {}", file_name(&written[0])),
-        (w, n) if w == n => format!("{w} Bilder fertig"),
-        (w, n) => format!("{w} von {n} Bildern fertig"),
-    };
-    let mut lines = Vec::new();
-    if !written.is_empty() {
-        let sizes = size_change(before, after);
-        lines.push(if copied { format!("{sizes} · in der Zwischenablage") } else { sizes });
-    }
-    lines.extend(problems.iter().take(2).cloned());
-    if problems.len() > 2 {
-        lines.push(format!("… und {} weitere (siehe Fehlerprotokoll)", problems.len() - 2));
-    }
+    let mut sink = toast::NoticeSink::new(&toast_tag());
+    let done = work(files, options, job, &mut |n| {
+        let _ = sink.publish(n);
+    });
+    finish_with_toast(&mut sink, &done);
+}
 
-    if toast::show(&tag, &title, &lines.join("
-")).is_err() {
-        // Benachrichtigungen abgeschaltet: wie früher Ton bzw. Meldungsfenster.
-        if problems.is_empty() {
-            crate::beep_ok();
-        } else {
-            let text = problems.join("
+fn toast_tag() -> String {
+    format!("konvertieren-{}", std::process::id())
+}
 
-");
-            unsafe {
-                MessageBoxW(None, &HSTRING::from(text), &HSTRING::from("UtilityCrab"), MB_OK | MB_ICONWARNING);
-            }
+/// Ergebnis als Toast; sind Benachrichtigungen abgeschaltet, Ton bzw. Meldungsfenster.
+fn finish_with_toast(sink: &mut toast::NoticeSink, notice: &popup::Notice) {
+    if sink.publish(notice).is_ok() {
+        return;
+    }
+    if matches!(notice.kind, popup::Kind::Success | popup::Kind::Running) {
+        crate::beep_ok();
+    } else {
+        let text = format!("{}\n\n{}", notice.title, notice.plain_lines().join("\n"));
+        unsafe {
+            MessageBoxW(None, &HSTRING::from(text), &HSTRING::from("UtilityCrab"), MB_OK | MB_ICONWARNING);
         }
     }
 }
 
-fn file_name(path: &Path) -> String {
-    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+/// Die eigentliche Arbeit: meldet laufend den Fortschritt und gibt das Ergebnis zurück.
+fn work(files: &[PathBuf], options: &Options, job: Job, publish: &mut dyn FnMut(&popup::Notice)) -> popup::Notice {
+    // Fortschritt je Datei in Promille.
+    let progress: Vec<AtomicU32> = files.iter().map(|_| AtomicU32::new(0)).collect();
+    let results: Mutex<Option<Vec<Result<Outcome, String>>>> = Mutex::new(None);
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let done = files
+                .par_iter()
+                .zip(&progress)
+                .map(|(file, slot)| convert_file(file, options, &|p| slot.store((p * 1000.0) as u32, Ordering::Relaxed)))
+                .collect();
+            *results.lock().unwrap() = Some(done);
+        });
+        while results.lock().unwrap().is_none() {
+            let fractions: Vec<f32> = progress.iter().map(|p| p.load(Ordering::Relaxed) as f32 / 1000.0).collect();
+            publish(&notice::running(job, files, &fractions));
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    let results = results.into_inner().unwrap().unwrap_or_default();
+    let written: Vec<PathBuf> = results
+        .iter()
+        .filter_map(|r| match r {
+            Ok(Outcome::Written { path, .. }) => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    for error in results.iter().filter_map(|r| r.as_ref().err()) {
+        crate::log_error(error);
+    }
+    let copied = !written.is_empty() && super::copy_to_clipboard(&written).is_ok();
+    notice::finished(job, files, &results, copied)
 }
 
 /// Warteschlange pro Auftrag: ein Ordner mit je einer Textdatei pro Prozess.

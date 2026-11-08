@@ -13,6 +13,47 @@ use winreg::RegKey;
 const APP_ID: &str = "Sniphs.UtilityCrab";
 const GROUP: &str = "utilitycrab";
 
+/// Zeigt einen fertigen Hinweis als Windows-Benachrichtigung.
+pub fn show_notice(tag: &str, notice: &crate::popup::Notice) -> Result<(), String> {
+    show(tag, &notice.title, &notice.plain_lines().join("\n"))
+}
+
+/// Gibt eine Folge von Hinweisen als Toasts aus: laufende als Fortschrittsbalken
+/// (erst nach einer Sekunde, damit kurze Aufträge nicht flackern), dann das Ergebnis.
+pub struct NoticeSink {
+    tag: String,
+    started: std::time::Instant,
+    /// `Some(None)`: Erstellen ist fehlgeschlagen, nicht erneut versuchen.
+    progress: Option<Option<Progress>>,
+}
+
+impl NoticeSink {
+    pub fn new(tag: &str) -> Self {
+        Self {
+            tag: tag.into(),
+            started: std::time::Instant::now(),
+            progress: None,
+        }
+    }
+
+    /// Fehler nur beim Ergebnis-Toast, damit der Aufrufer auf etwas anderes ausweichen kann.
+    pub fn publish(&mut self, notice: &crate::popup::Notice) -> Result<(), String> {
+        if notice.kind != crate::popup::Kind::Running {
+            return show_notice(&self.tag, notice);
+        }
+        if self.started.elapsed() < std::time::Duration::from_secs(1) {
+            return Ok(());
+        }
+        let toast = self
+            .progress
+            .get_or_insert_with(|| progress(&self.tag, &notice.title).ok());
+        if let (Some(toast), Some((fraction, label))) = (toast, notice.progress()) {
+            toast.update(fraction, label);
+        }
+        Ok(())
+    }
+}
+
 /// Ein laufender Fortschritts-Toast; [`Progress::update`] verschiebt den Balken.
 pub struct Progress {
     notifier: ToastNotifier,

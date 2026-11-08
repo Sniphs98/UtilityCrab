@@ -3675,6 +3675,7 @@ dependencies = [
  "image",
  "ort",
  "oxipng",
+ "raw-window-handle",
  "rayon",
  "serde",
  "serde_json",

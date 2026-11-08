@@ -476,7 +476,7 @@ impl ConverterApp {
                         _ => (b, a),
                     }
                 });
-                ui.label(RichText::new(format!("Gesamt: {} → {}", human_size(before), human_size(after))).weak());
+                ui.label(RichText::new(format!("Gesamt: von {} auf {}", human_size(before), human_size(after))).weak());
             }
         });
         if !running {

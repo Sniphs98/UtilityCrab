@@ -5,6 +5,7 @@
 //! Geschrieben werden PNG (mit oxipng optimiert), JPG, WebP (libwebp), BMP, GIF, TIFF und ICO.
 
 pub mod batch;
+mod notice;
 pub mod ui;
 mod wic;
 
@@ -71,6 +72,14 @@ impl Format {
             Format::Gif => "GIF",
             Format::Tiff => "TIFF",
             Format::Ico => "ICO (Symbol)",
+        }
+    }
+
+    /// Kurzname für Fließtext, z. B. „In ICO umgewandelt“.
+    pub fn short(self) -> &'static str {
+        match self {
+            Format::Ico => "ICO",
+            other => other.label(),
         }
     }
 
@@ -472,7 +481,7 @@ pub fn human_size(bytes: u64) -> String {
     text.replace('.', ",")
 }
 
-/// Z. B. „2,4 MB → 610 KB (−75 %)“.
+/// Z. B. „von 2,4 MB auf 610 KB (−75 %)“.
 pub fn size_change(before: u64, after: u64) -> String {
     let change = (after as f64 / before.max(1) as f64 - 1.0) * 100.0;
     let sign = if change < 0.0 { "−" } else { "+" };
@@ -482,10 +491,10 @@ pub fn size_change(before: u64, after: u64) -> String {
     } else {
         format!("{:.0}", change.abs())
     };
-    format!("{} → {} ({sign}{percent} %)", human_size(before), human_size(after))
+    format!("von {} auf {} ({sign}{percent} %)", human_size(before), human_size(after))
 }
 
-/// Kurzbeschreibung eines Ergebnisses, z. B. „2,4 MB → 610 KB (−75 %)“.
+/// Kurzbeschreibung eines Ergebnisses, z. B. „von 2,4 MB auf 610 KB (−75 %)“.
 pub fn describe(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Written { before, after, .. } => size_change(*before, *after),

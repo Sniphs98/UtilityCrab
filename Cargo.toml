@@ -19,6 +19,7 @@ oxipng = { version = "10", default-features = false, features = ["parallel"] }
 webp = { version = "0.3", default-features = false }
 winreg = "0.56"
 rayon = "1"
+raw-window-handle = "0.6"
 
 [dependencies.windows]
 version = "0.62"
@@ -42,6 +43,10 @@ features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ]

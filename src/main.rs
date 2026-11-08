@@ -7,6 +7,7 @@ mod crab_pixels;
 mod download;
 mod icon;
 mod ocr;
+mod popup;
 mod settings;
 mod settings_ui;
 mod shell_menu;
@@ -69,6 +70,8 @@ fn main() {
     match args.first().map(String::as_str) {
         Some(SETTINGS_ARG) => return settings_ui::run(),
         Some(convert::CLI_ARG) => return convert::batch::run(&args[1..]),
+        Some(popup::remote::ARG) => return popup::remote::serve(),
+        Some(popup::demo::ARG) => return popup::demo::run(args.get(1).map(String::as_str)),
         Some(shell_menu::INSTALL_ARG) => return report(shell_menu::sync(Settings::load().context_menu)),
         Some(shell_menu::UNINSTALL_ARG) => {
             toast::unregister();
@@ -283,14 +286,19 @@ fn spawn_self(args: &[&str]) -> Result<Child, String> {
 }
 
 /// Startet eine Texterkennung in eigenem Thread, weil dabei auf den Benutzer gewartet wird.
-fn spawn_ocr(job: fn() -> Result<(), String>) -> Result<(), String> {
+fn spawn_ocr(job: fn() -> Result<String, String>) -> Result<(), String> {
     if OCR_BUSY.swap(true, Ordering::SeqCst) {
         return Err("Texterkennung läuft bereits".into());
     }
     thread::spawn(move || {
         let result = job();
         OCR_BUSY.store(false, Ordering::SeqCst);
-        report(result);
+        if let Err(e) = &result {
+            log_error(e);
+        }
+        if let Some(notice) = ocr::notice(&result) {
+            popup::remote::notify(notice);
+        }
     });
     Ok(())
 }

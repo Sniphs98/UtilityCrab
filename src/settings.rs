@@ -23,6 +23,17 @@ pub struct Settings {
     pub pronunciations: Vec<Pronunciation>,
     /// Untermenü „Konvertieren“ im Explorer-Kontextmenü von Bildern.
     pub context_menu: bool,
+    /// Wie fertige Konvertierungen gemeldet werden.
+    pub notify: Notify,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum Notify {
+    /// Eigenes Popup unten mittig.
+    #[default]
+    Popup,
+    /// Windows-Benachrichtigung (unten rechts, landet im Benachrichtigungscenter).
+    Windows,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -42,6 +53,7 @@ impl Default for Settings {
             hotkey_ocr: "Ctrl+Alt+O".into(),
             pronunciations: Vec::new(),
             context_menu: true,
+            notify: Notify::Popup,
         }
     }
 }

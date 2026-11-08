@@ -9,7 +9,7 @@ use crate::clipboard;
 
 /// Öffnet das Windows-Ausschneidetool, wartet auf den Screenshot und
 /// legt den darin erkannten Text in die Zwischenablage.
-pub fn snip_to_clipboard() -> Result<(), String> {
+pub fn snip_to_clipboard() -> Result<String, String> {
     let before = clipboard::sequence_number();
     Command::new("explorer")
         .arg("ms-screenclip:")
@@ -25,7 +25,7 @@ pub fn snip_to_clipboard() -> Result<(), String> {
 }
 
 /// Erkennt Text im Bild der Zwischenablage und ersetzt das Bild durch den Text.
-pub fn clipboard_image_to_clipboard() -> Result<(), String> {
+pub fn clipboard_image_to_clipboard() -> Result<String, String> {
     let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
     let image = cb
         .get_image()
@@ -37,9 +37,8 @@ pub fn clipboard_image_to_clipboard() -> Result<(), String> {
         return Err("Kein Text im Bild gefunden".into());
     }
 
-    cb.set_text(text).map_err(|e| e.to_string())?;
-    crate::beep_ok();
-    Ok(())
+    cb.set_text(text.clone()).map_err(|e| e.to_string())?;
+    Ok(text)
 }
 
 /// Texterkennung mit der eingebauten Windows-OCR (Sprachen aus dem Benutzerprofil).
@@ -109,4 +108,44 @@ fn shrink_to_fit(pixels: Vec<u8>, w: u32, h: u32, max: u32) -> (Vec<u8>, u32, u3
         }
     }
     (out, nw, nh)
+}
+
+/// Hinweis nach einer Texterkennung; `None`, wenn der Benutzer nur abgebrochen hat.
+pub fn notice(result: &Result<String, String>) -> Option<crate::popup::Notice> {
+    use crate::popup::{Block, Icon, Kind, Notice};
+    match result {
+        Ok(text) => {
+            let chars = text.chars().filter(|c| !c.is_whitespace()).count();
+            let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+            let subtitle = format!(
+                "{chars} {} · {lines} {}",
+                "Zeichen",
+                if lines == 1 { "Zeile" } else { "Zeilen" }
+            );
+            Some(
+                Notice::new(Kind::Success, "Text kopiert")
+                    .subtitle(subtitle)
+                    .block(Block::Quote(text.clone()))
+                    .block(Block::Chip {
+                        icon: Icon::Clipboard,
+                        text: "In Zwischenablage".into(),
+                    }),
+            )
+        }
+        Err(e) if e == "Kein Bildausschnitt aufgenommen" => None,
+        Err(e) if e == "Kein Text im Bild gefunden" => Some(
+            Notice::new(Kind::Info, "Kein Text gefunden")
+                .block(Block::Text("Im Bildausschnitt wurde kein Text erkannt.".into()))
+                .block(Block::Hint(
+                    "Klappt am besten mit gut lesbarem, nicht zu kleinem Text. \
+                     Die Sprache muss in Windows installiert sein."
+                        .into(),
+                )),
+        ),
+        Err(e) if e == "Kein Bild in der Zwischenablage" => Some(
+            Notice::new(Kind::Info, "Kein Bild in der Zwischenablage")
+                .block(Block::Text("Erst ein Bild oder einen Screenshot kopieren, dann noch einmal versuchen.".into())),
+        ),
+        Err(e) => Some(Notice::new(Kind::Error, "Texterkennung fehlgeschlagen").block(Block::Text(e.clone()))),
+    }
 }

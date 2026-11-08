@@ -5,8 +5,8 @@ A small Windows tray tool written in Rust that reads selected text aloud, copies
 ## Features
 
 - **Read aloud:** select text anywhere and press a hotkey. Speech starts after the first sentence is ready, and pressing the hotkey again stops it.
-- **Text from screenshots (OCR):** snip a region of the screen and the recognized text lands in your clipboard. Uses the built-in Windows OCR.
-- **Image converter:** right-click an image in Explorer → **Konvertieren** → convert it to PNG, JPG, WebP or ICO, or **Verkleinern** (shrink) it. Several selected files are handled in one go. Afterwards the new files are on the clipboard (paste them with Ctrl+V into a folder, chat or e-mail) and a notification shows the size change; longer jobs show a progress bar in the notification. **Weitere Optionen …** opens a window with every setting:
+- **Text from screenshots (OCR):** snip a region of the screen and the recognized text lands in your clipboard; a popup shows what was copied. Uses the built-in Windows OCR.
+- **Image converter:** right-click an image in Explorer → **Konvertieren** → convert it to PNG, JPG, WebP or ICO, or **Verkleinern** (shrink) it. Several selected files are handled in one go. Afterwards the new files are on the clipboard (paste them with Ctrl+V into a folder, chat or e-mail) and a small popup at the bottom center of the screen shows the progress in percent and then the result (size change, explanations, a button to show the file). Windows notifications can be chosen instead in the settings. **Weitere Optionen …** opens a window with every setting:
   - target format (PNG, JPG, WebP, BMP, GIF, TIFF, ICO), quality, resizing by longest edge or percent
   - a maximum file size in KB: quality and, if needed, resolution are lowered until the file fits
   - presets for e-mail, websites and "under 1 MB"
@@ -49,6 +49,15 @@ Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSo
 ```
 
 This builds the release and writes `dist\UtilityCrab-Setup-<version>.exe`. The setup installs per user (no admin rights), adds a Start menu entry and can register UtilityCrab to start with Windows.
+
+## Popups
+
+`src/popup` is a small reusable module for these popups: a `Notice` is built from blocks (progress, before/after stat, text, quote, hint, chip, details) and can be updated from another thread. The tray app shows them through a separate process (`--hinweis`, JSON lines on stdin). To check the design, run:
+
+```sh
+utility_crab.exe --hinweis-demo            # all states one after another
+utility_crab.exe --hinweis-demo groesser   # one state, stays open
+```
 
 ## Data
 
