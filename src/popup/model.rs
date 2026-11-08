@@ -64,12 +64,14 @@ pub enum Action {
     RevealFile { label: String, path: PathBuf },
     /// Datei oder Ordner mit dem Standardprogramm öffnen.
     Open { label: String, path: PathBuf },
+    /// UtilityCrab mit diesen Argumenten starten (z. B. ein Update installieren).
+    Run { label: String, args: Vec<String> },
 }
 
 impl Action {
     pub fn label(&self) -> &str {
         match self {
-            Action::RevealFile { label, .. } | Action::Open { label, .. } => label,
+            Action::RevealFile { label, .. } | Action::Open { label, .. } | Action::Run { label, .. } => label,
         }
     }
 
@@ -81,6 +83,10 @@ impl Action {
                 .raw_arg(format!("/select,\"{}\"", path.display()))
                 .spawn(),
             Action::Open { path, .. } => std::process::Command::new("explorer").arg(path).spawn(),
+            Action::Run { args, .. } => match std::env::current_exe() {
+                Ok(exe) => std::process::Command::new(exe).args(args).spawn(),
+                Err(e) => Err(e),
+            },
         };
     }
 }

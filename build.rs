@@ -7,6 +7,10 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=src/crab_pixels.rs");
+    // Release-Version (z. B. 0.1.0.7) vom Workflow bzw. installer/build.ps1; leer = lokaler Build.
+    println!("cargo:rerun-if-env-changed=UTILITYCRAB_VERSION");
+    let version = std::env::var("UTILITYCRAB_VERSION").unwrap_or_default();
+    println!("cargo:rustc-env=UTILITYCRAB_VERSION={version}");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

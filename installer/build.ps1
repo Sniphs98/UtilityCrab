@@ -9,6 +9,8 @@ if (-not $Version) {
     $Version = $match.Matches[0].Groups[1].Value
 }
 
+# Die .exe kennt so ihre Release-Version (für den Update-Check).
+$env:UTILITYCRAB_VERSION = $Version
 cargo build --release
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

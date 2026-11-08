@@ -14,6 +14,7 @@ mod shell_menu;
 mod toast;
 mod tts;
 mod ui_kit;
+mod update;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -56,6 +57,8 @@ enum Command {
     SettingsChanged,
     /// Fehlerprotokoll im Editor öffnen.
     OpenLog,
+    /// Von Hand nach Updates suchen.
+    CheckUpdate,
     Quit,
 }
 
@@ -72,6 +75,8 @@ fn main() {
         Some(SETTINGS_ARG) => return settings_ui::run(args.get(1).map(String::as_str)),
         Some(convert::CLI_ARG) => return convert::batch::run(&args[1..]),
         Some(popup::remote::ARG) => return popup::remote::serve(),
+        Some(update::INSTALL_ARG) => return update::install(&args[1..]),
+        Some(update::CHECK_ARG) => return update::check_now(),
         Some(popup::demo::ARG) => return popup::demo::run(args.get(1).map(String::as_str)),
         Some(shell_menu::INSTALL_ARG) => return report(shell_menu::sync(Settings::load().context_menu)),
         Some(shell_menu::UNINSTALL_ARG) => {
@@ -114,6 +119,7 @@ fn main() {
     let convert_item = MenuItem::new("Bilder konvertieren / verkleinern …", true, None);
     let settings_item = MenuItem::new("Einstellungen …", true, None);
     let log_item = MenuItem::new("Fehlerprotokoll öffnen", true, None);
+    let update_item = MenuItem::new("Nach Updates suchen", true, None);
     let quit_item = MenuItem::new("Beenden", true, None);
 
     let menu = Menu::new();
@@ -124,6 +130,7 @@ fn main() {
         &convert_item,
         &PredefinedMenuItem::separator(),
         &settings_item,
+        &update_item,
         &log_item,
         &quit_item,
     ])
@@ -136,6 +143,7 @@ fn main() {
         (convert_item.id().clone(), Command::OpenConverter),
         (settings_item.id().clone(), Command::OpenSettings),
         (log_item.id().clone(), Command::OpenLog),
+        (update_item.id().clone(), Command::CheckUpdate),
         (quit_item.id().clone(), Command::Quit),
     ];
     let menu_tx = tx.clone();
@@ -231,6 +239,7 @@ fn worker_loop(rx: mpsc::Receiver<Command>, main_thread: u32) {
     tts::preload(&settings);
     // Bei jedem Start eintragen, damit der Programmpfad nach einem Update stimmt.
     report(shell_menu::sync(settings.context_menu));
+    update::spawn_background_checks(|| Settings::load().auto_update);
 
     for cmd in rx {
         let result = match cmd {
@@ -245,6 +254,10 @@ fn worker_loop(rx: mpsc::Receiver<Command>, main_thread: u32) {
                 shell_menu::sync(settings.context_menu)
             }
             Command::OpenLog => open_log(),
+            Command::CheckUpdate => {
+                thread::spawn(|| popup::remote::notify(update::check_notice(&update::check())));
+                Ok(())
+            }
             Command::Quit => {
                 speaker.stop();
                 unsafe {
