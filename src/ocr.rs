@@ -1,6 +1,7 @@
 use std::process::Command;
 use std::time::Duration;
 
+use windows::Globalization::Language;
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::{OcrEngine, OcrResult};
 use windows::Storage::Streams::DataWriter;
@@ -41,7 +42,7 @@ pub fn clipboard_image_to_clipboard() -> Result<String, String> {
     Ok(text)
 }
 
-/// Texterkennung mit der eingebauten Windows-OCR (Sprachen aus dem Benutzerprofil).
+/// Texterkennung mit der eingebauten Windows-OCR (Sprache aus dem Benutzerprofil, bei Bedarf Deutsch oder Englisch).
 pub fn recognize(width: u32, height: u32, rgba: &[u8]) -> windows::core::Result<String> {
     let (result, _) = run_engine(width, height, rgba)?;
     let lines: Vec<String> = result
@@ -101,7 +102,34 @@ fn run_engine(width: u32, height: u32, rgba: &[u8]) -> windows::core::Result<(Oc
     )?;
 
     let engine = OcrEngine::TryCreateFromUserProfileLanguages()?;
-    Ok((engine.RecognizeAsync(&bitmap)?.join()?, scale))
+    let result = engine.RecognizeAsync(&bitmap)?.join()?;
+    // Windows liest nur in der ersten Sprache des Profils. Eine deutsche OCR macht aus englischem
+    // Text schnell Unsinn, eine englische kennt keine Umlaute. Deshalb: Ist der erkannte Text in
+    // der jeweils anderen Sprache, noch einmal mit der passenden OCR lesen (falls installiert).
+    if let Some(better) = engine_for_text(&engine, &result) {
+        return Ok((better.RecognizeAsync(&bitmap)?.join()?, scale));
+    }
+    Ok((result, scale))
+}
+
+/// Eine OCR in der Sprache des erkannten Textes (Deutsch oder Englisch), falls sie besser passt
+/// als `current` und in Windows installiert ist.
+fn engine_for_text(current: &OcrEngine, result: &OcrResult) -> Option<OcrEngine> {
+    let text = result.Text().ok()?.to_string();
+    let wanted = crate::lang::detect_german_or_english(&text)?;
+    let speaks = |language: &Language| {
+        language
+            .LanguageTag()
+            .is_ok_and(|tag| tag.to_string().split('-').next().is_some_and(|p| p.eq_ignore_ascii_case(wanted)))
+    };
+    if current.RecognizerLanguage().is_ok_and(|l| speaks(&l)) {
+        return None;
+    }
+    let language = OcrEngine::AvailableRecognizerLanguages()
+        .ok()?
+        .into_iter()
+        .find(|l| speaks(l))?;
+    OcrEngine::TryCreateFromLanguage(&language).ok()
 }
 
 /// Verkleinert ein 4-Kanal-Bild (Mittelwert über Pixelblöcke), sodass keine Seite `max` überschreitet.
@@ -168,7 +196,8 @@ pub fn notice(result: &Result<String, String>) -> Option<crate::popup::Notice> {
                 .block(Block::Text("Im Bildausschnitt wurde kein Text erkannt.".into()))
                 .block(Block::Hint(
                     "Klappt am besten mit gut lesbarem, nicht zu kleinem Text. \
-                     Die Sprache muss in Windows installiert sein."
+                     Die Sprache muss in Windows installiert sein (für Deutsch und Englisch \
+                     beide unter „Zeit und Sprache > Sprache“ hinzufügen)."
                         .into(),
                 )),
         ),

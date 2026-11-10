@@ -6,6 +6,7 @@ mod convert;
 mod crab_pixels;
 mod download;
 mod icon;
+mod lang;
 mod ocr;
 mod popup;
 mod screenshot;
