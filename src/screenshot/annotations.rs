@@ -29,6 +29,11 @@ pub trait Annotation: Send + Sync {
     fn step_number(&self) -> Option<u32> {
         None
     }
+
+    /// Spotlights teilen sich eine gemeinsame Abdunklung, siehe [`Document::compose`](super::document::Document::compose).
+    fn as_spotlight(&self) -> Option<&Spotlight> {
+        None
+    }
 }
 
 impl Clone for Box<dyn Annotation> {
@@ -46,6 +51,10 @@ pub struct Style {
     pub width: f32,
     pub filled: bool,
     pub redact: RedactMode,
+    /// Weichzeichner mit runden Ecken und nach außen auslaufendem Rand.
+    pub soft_edge: bool,
+    /// Breite des auslaufenden Randes in Bildpixeln.
+    pub softness: f32,
 }
 
 impl Default for Style {
@@ -55,6 +64,8 @@ impl Default for Style {
             width: 4.0,
             filled: false,
             redact: RedactMode::Pixelate,
+            soft_edge: true,
+            softness: 16.0,
         }
     }
 }
@@ -63,6 +74,15 @@ impl Style {
     pub fn color(&self) -> Color32 {
         let [r, g, b, a] = self.color;
         Color32::from_rgba_unmultiplied(r, g, b, a)
+    }
+
+    /// Breite des weichen Randes beim Weichzeichnen, 0 = aus.
+    pub fn soft(&self) -> f32 {
+        if self.soft_edge {
+            self.softness
+        } else {
+            0.0
+        }
     }
 }
 
@@ -403,11 +423,29 @@ pub struct Redact {
     pub mode: RedactMode,
     /// Blockgröße bzw. Radius in Pixeln.
     pub strength: f32,
+    /// Nur Weichzeichnen: Breite des weich auslaufenden Randes, 0 = harte Kante.
+    pub soft: f32,
 }
 
 impl Redact {
     fn area(&self) -> IRect {
         IRect::round(self.rect)
+    }
+
+    /// Breite des auslaufenden Randes (ganze Pixel), 0 wenn aus.
+    fn feather(&self) -> i32 {
+        if self.mode == RedactMode::Blur {
+            self.soft.max(0.0).round() as i32
+        } else {
+            0
+        }
+    }
+
+    /// Fläche samt auslaufendem Rand.
+    fn outer(&self) -> IRect {
+        let f = self.feather();
+        let a = self.area();
+        IRect::new(a.x - f, a.y - f, a.w + 2 * f, a.h + 2 * f)
     }
 }
 
@@ -422,9 +460,18 @@ impl Annotation for Redact {
         match self.mode {
             RedactMode::Pixelate => canvas.pixelate(area, strength.round() as i32),
             RedactMode::Blur => {
+                let feather = self.feather();
+                // Mit weichem Rand wird auch der Rand weichgezeichnet und danach Stück für
+                // Stück mit dem Original überblendet: innen voll, nach außen auslaufend.
+                let outer = self.outer();
+                let original = (feather > 0).then(|| canvas.crop(outer)).flatten();
                 // Vorher grob verpixeln: reiner Weichzeichner lässt sich teils zurückrechnen.
-                canvas.pixelate(area, (strength / 2.0).round().max(2.0) as i32);
-                canvas.blur(area, strength.round() as i32);
+                canvas.pixelate(outer, (strength / 2.0).round().max(2.0) as i32);
+                canvas.blur(outer, strength.round() as i32);
+                if let Some(original) = original {
+                    let corner = (feather as f32).min(area.w.min(area.h) as f32 / 2.0);
+                    canvas.blend_soft_edge(&original, area.to_rect(), corner, feather as f32);
+                }
             }
             RedactMode::Black => {
                 if let Some(path) = canvas::rect_path(area.to_rect(), 0.0) {
@@ -435,7 +482,7 @@ impl Annotation for Redact {
     }
 
     fn bounds(&self) -> Rect {
-        self.area().to_rect()
+        self.outer().to_rect()
     }
 
     fn translate(&mut self, delta: Vec2) {
@@ -458,16 +505,33 @@ pub struct Spotlight {
     pub dim: f32,
 }
 
-impl Annotation for Spotlight {
-    fn render(&self, canvas: &mut Canvas) {
-        let path = if self.ellipse {
+impl Spotlight {
+    fn path(&self) -> Option<tiny_skia::Path> {
+        if self.ellipse {
             canvas::ellipse_path(self.rect)
         } else {
             canvas::rect_path(self.rect, 6.0)
-        };
-        if let Some(path) = path {
-            canvas.fill_outside(&path, Color32::from_black_alpha((self.dim.clamp(0.0, 1.0) * 255.0) as u8));
         }
+    }
+
+    /// Eine einzige Abdunklung mit einem Loch je Spotlight – mehrere Spotlights dunkeln
+    /// also nicht immer weiter ab. Die Stärke kommt vom zuletzt gesetzten.
+    pub fn render_all(spots: &[&Spotlight], canvas: &mut Canvas) {
+        let Some(last) = spots.last() else {
+            return;
+        };
+        let paths: Vec<_> = spots.iter().filter_map(|s| s.path()).collect();
+        canvas.fill_outside(&paths, Color32::from_black_alpha((last.dim.clamp(0.0, 1.0) * 255.0) as u8));
+    }
+}
+
+impl Annotation for Spotlight {
+    fn render(&self, canvas: &mut Canvas) {
+        Spotlight::render_all(&[self], canvas);
+    }
+
+    fn as_spotlight(&self) -> Option<&Spotlight> {
+        Some(self)
     }
 
     /// Wirkt auf das ganze Bild.

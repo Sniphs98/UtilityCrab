@@ -6,7 +6,7 @@ use std::sync::Arc;
 use eframe::egui::{Rect, Vec2};
 use image::RgbaImage;
 
-use super::annotations::Annotation;
+use super::annotations::{Annotation, Spotlight};
 use super::canvas::{Canvas, IRect};
 
 #[derive(Clone)]
@@ -34,9 +34,21 @@ impl Document {
     }
 
     /// Fertiges Bild mit allen Anmerkungen.
+    ///
+    /// Alle Spotlights zusammen ergeben eine einzige Abdunklung (an der Stelle des ersten),
+    /// sonst würde jedes weitere Spotlight den Rest noch dunkler machen.
     pub fn compose(&self) -> Canvas {
         let mut canvas = Canvas::from_image(&self.base);
+        let spots: Vec<&Spotlight> = self.items.iter().filter_map(|i| i.as_spotlight()).collect();
+        let mut dimmed = false;
         for item in &self.items {
+            if item.as_spotlight().is_some() {
+                if !dimmed {
+                    Spotlight::render_all(&spots, &mut canvas);
+                    dimmed = true;
+                }
+                continue;
+            }
             item.render(&mut canvas);
         }
         canvas
