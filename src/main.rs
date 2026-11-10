@@ -264,6 +264,8 @@ fn update_labels(settings: &Settings, tray: &TrayIcon, speak_item: &MenuItem, sn
 
 fn worker_loop(rx: mpsc::Receiver<Command>, main_thread: u32) {
     let mut speaker = tts::Speaker::new();
+    // Zuletzt vorgelesener Text, um „neuer Text markiert“ von „stoppen“ zu unterscheiden.
+    let mut last_text: Option<String> = None;
     let mut settings_window: Option<Child> = None;
     let mut capture_window: Option<Child> = None;
     let settings = Settings::load();
@@ -274,7 +276,7 @@ fn worker_loop(rx: mpsc::Receiver<Command>, main_thread: u32) {
 
     for cmd in rx {
         let result = match cmd {
-            Command::SpeakSelection => speak_selection(&mut speaker),
+            Command::SpeakSelection => speak_selection(&mut speaker, &mut last_text),
             Command::OcrSnip => spawn_ocr(ocr::snip_to_clipboard),
             Command::OcrClipboard => spawn_ocr(ocr::clipboard_image_to_clipboard),
             Command::Snip(delay) => start_capture(&mut capture_window, delay),
@@ -309,13 +311,24 @@ fn worker_loop(rx: mpsc::Receiver<Command>, main_thread: u32) {
     }
 }
 
-fn speak_selection(speaker: &mut tts::Speaker) -> Result<(), String> {
-    if speaker.is_speaking() {
-        speaker.stop();
-        return Ok(());
+/// Liest den markierten Text vor. Läuft schon etwas: Ist inzwischen anderer Text markiert,
+/// wird der vorgelesen, sonst wird gestoppt.
+fn speak_selection(speaker: &mut tts::Speaker, last_text: &mut Option<String>) -> Result<(), String> {
+    let speaking = speaker.is_speaking();
+    let selection = clipboard::copy_selection();
+    match selection {
+        Ok(text) if !speaking || last_text.as_deref() != Some(text.as_str()) => {
+            speaker.speak(&text, &Settings::load())?;
+            *last_text = Some(text);
+            Ok(())
+        }
+        _ if speaking => {
+            speaker.stop();
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
     }
-    let text = clipboard::copy_selection()?;
-    speaker.speak(&text, &Settings::load())
 }
 
 /// Startet den Einstellungsdialog als eigenen Prozess (höchstens einmal gleichzeitig).
