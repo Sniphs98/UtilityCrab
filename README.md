@@ -5,7 +5,7 @@
 <h1 align="center">UtilityCrab</h1>
 
 <p align="center">
-  A small Windows tray tool written in Rust that reads selected text aloud, copies text from images and converts or shrinks images.
+  A small Windows tray tool written in Rust that reads selected text aloud, takes and annotates screenshots, copies text from images and converts or shrinks images.
 </p>
 
 <p align="center">
@@ -15,6 +15,14 @@
 ## Features
 
 - **Read aloud:** select text anywhere and press a hotkey. Speech starts after the first sentence is ready, and pressing the hotkey again stops it.
+- **Screenshots (Snipping Tool replacement):** press `Ctrl+Alt+A` (or use the tray menu) and pick a **rectangle**, a **window**, a **whole screen** or a **freeform** shape. A magnifier next to the cursor shows the pixels and their color; a single click in rectangle mode takes the window under the cursor. Delays of 3, 5 or 10 seconds are available. The screenshot is copied to the clipboard, optionally saved to `Pictures\Screenshots`, and opened in the editor.
+- **Image editor:** edit screenshots or **existing photos** (open button / `Ctrl+O`, drag & drop, `Ctrl+V`, tray menu, or right-click an image in Explorer → **Mit UtilityCrab bearbeiten**). Tools:
+  - pen, highlighter, eraser, arrow, line, rectangle, ellipse (filled or outlined, Shift for square/circle/45°), text (optionally on a colored box), numbered step markers 1, 2, 3 …
+  - **redact** an area: pixelate, blur or black out
+  - **automatically redact sensitive data**: OCR finds e-mail addresses, phone numbers, IBANs, credit card numbers (optionally IP addresses, links or all text) and covers them
+  - spotlight (darkens everything except an area), crop, select & move, undo/redo, zoom (`Ctrl`+wheel, `Ctrl+0`/`Ctrl+1`) and pan (middle mouse or Space)
+  - recognize text and copy it, **pin** the image to the screen (always-on-top window), copy, save as PNG, JPG, WebP or BMP
+  - edits are copied to the clipboard automatically (can be turned off); each tool remembers its color and size
 - **Text from screenshots (OCR):** snip a region of the screen and the recognized text lands in your clipboard; a popup shows what was copied. Uses the built-in Windows OCR.
 - **Image converter:** right-click an image in Explorer → **Konvertieren** → convert it to PNG, JPG, WebP or ICO, or **Verkleinern** (shrink) it. Several selected files are handled in one go. Afterwards the new files are on the clipboard (paste them with Ctrl+V into a folder, chat or e-mail) and a small popup at the bottom center of the screen shows the progress in percent and then the result (size change, explanations, a button to show the file). Windows notifications can be chosen instead in the settings. **Weitere Optionen …** opens a window with every setting:
   - target format (PNG, JPG, WebP, BMP, GIF, TIFF, ICO), quality, resizing by longest edge or percent
@@ -38,6 +46,7 @@
 |---|---|
 | `Ctrl+Alt+S` | Read selected text / stop |
 | `Ctrl+Alt+O` | Copy text from a screen snip |
+| `Ctrl+Alt+A` | Take a screenshot |
 
 Both hotkeys can be changed in the settings window, which you open by right-clicking the tray icon and choosing **Einstellungen …**.
 
@@ -65,6 +74,21 @@ This builds the release and writes `dist\UtilityCrab-Setup-<version>.exe`. The s
 
 Every push to `main` builds the setup on GitHub Actions and publishes it as release `v<Cargo version>.<run number>`, for example `v0.1.0.7`. Installed copies pick it up through the update check.
 
+## Extending the screenshot editor
+
+The editor lives in `src/screenshot` and is built so new features are mostly one entry in a list:
+
+| What | Where |
+|---|---|
+| New drawing tool | implement `Tool` (or use `DragTool` with a `make` function) and add it to `tools::all()` in `tools.rs`; toolbar button, shortcut, options bar and remembered style come with it |
+| New kind of mark on the image | implement `Annotation` in `annotations.rs` (render onto a `Canvas`, bounds, hit test, move) |
+| New toolbar action | add an `ActionDef` to `ACTIONS` in `editor.rs` (button, tooltip, shortcut, optional menu) |
+| New pattern for automatic redaction | add a `Pattern` to `PATTERNS` in `redact.rs` |
+| New capture mode | add a variant to `CaptureMode` in `overlay.rs` |
+| New icon | add a `Glyph` in `icons.rs` |
+
+The live preview renders the annotation being drawn onto a copy of just its area, with the same code as the final image, so what you see is exactly what gets saved.
+
 ## Popups
 
 `src/popup` is a small reusable module for these popups: a `Notice` is built from blocks (progress, before/after stat, text, quote, hint, chip, details) and can be updated from another thread. The tray app shows them through a separate process (`--hinweis`, JSON lines on stdin). To check the design, run:
@@ -76,7 +100,7 @@ utility_crab.exe --hinweis-demo groesser   # one state, stays open
 
 ## Data
 
-Settings, the error log and downloaded models are stored in `%LOCALAPPDATA%\UtilityCrab`.
+Settings, the error log and downloaded models are stored in `%LOCALAPPDATA%\UtilityCrab`. The screenshot editor remembers its tool styles in `screenshot.json` there; screenshots that were not saved are kept in `screenshots-temp` for a day.
 
 ## Notes
 

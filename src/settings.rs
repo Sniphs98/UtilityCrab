@@ -19,6 +19,7 @@ pub struct Settings {
     /// Tastenkürzel im Format von `global-hotkey`, z. B. "Ctrl+Alt+S".
     pub hotkey_speak: String,
     pub hotkey_ocr: String,
+    pub hotkey_snip: String,
     /// Aussprache-Wörterbuch für falsch gesprochene Wörter.
     pub pronunciations: Vec<Pronunciation>,
     /// Untermenü „Konvertieren“ im Explorer-Kontextmenü von Bildern.
@@ -27,6 +28,16 @@ pub struct Settings {
     pub notify: Notify,
     /// Täglich nach Updates suchen (nur installierte Release-Versionen).
     pub auto_update: bool,
+    /// Nach einem Screenshot den Editor öffnen (sonst nur ein Hinweis mit „Bearbeiten“).
+    pub snip_open_editor: bool,
+    /// Screenshots und Änderungen im Editor automatisch in die Zwischenablage kopieren.
+    pub snip_copy: bool,
+    /// Jeden Screenshot automatisch in `snip_folder` speichern.
+    pub snip_autosave: bool,
+    /// Ordner für automatisch gespeicherte Screenshots (leer = Bilder\Screenshots).
+    pub snip_folder: String,
+    /// Eintrag „Mit UtilityCrab bearbeiten“ im Explorer-Kontextmenü von Bildern.
+    pub edit_context_menu: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -53,10 +64,16 @@ impl Default for Settings {
             auto_language: true,
             hotkey_speak: "Ctrl+Alt+S".into(),
             hotkey_ocr: "Ctrl+Alt+O".into(),
+            hotkey_snip: "Ctrl+Alt+A".into(),
             pronunciations: Vec::new(),
             context_menu: true,
             notify: Notify::Popup,
             auto_update: true,
+            snip_open_editor: true,
+            snip_copy: true,
+            snip_autosave: false,
+            snip_folder: String::new(),
+            edit_context_menu: true,
         }
     }
 }
@@ -81,6 +98,7 @@ impl Settings {
         for (hotkey, default) in [
             (&mut settings.hotkey_speak, defaults.hotkey_speak),
             (&mut settings.hotkey_ocr, defaults.hotkey_ocr),
+            (&mut settings.hotkey_snip, defaults.hotkey_snip),
         ] {
             if ["Left", "Right"].iter().any(|side| hotkey.ends_with(side)) {
                 *hotkey = default;

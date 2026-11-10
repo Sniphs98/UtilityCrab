@@ -8,6 +8,7 @@ mod download;
 mod icon;
 mod ocr;
 mod popup;
+mod screenshot;
 mod settings;
 mod settings_ui;
 mod shell_menu;
@@ -32,7 +33,7 @@ use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, PostThreadMessageW, SetTimer, TranslateMessage, MB_ICONHAND,
+    AllowSetForegroundWindow, DispatchMessageW, GetMessageW, ASFW_ANY, PostThreadMessageW, SetTimer, TranslateMessage, MB_ICONHAND,
     MB_OK, MSG, WM_QUIT, WM_TIMER,
 };
 
@@ -50,6 +51,10 @@ enum Command {
     OcrSnip,
     /// Bild aus der Zwischenablage erkennen und den Text kopieren.
     OcrClipboard,
+    /// Screenshot aufnehmen (Auswahl, danach Editor); Zahl = Verzögerung in Sekunden.
+    Snip(u32),
+    /// Bildeditor öffnen (leer bzw. mit dem Bild aus der Zwischenablage).
+    OpenEditor { clipboard: bool },
     OpenSettings,
     /// Konverter-Fenster öffnen.
     OpenConverter,
@@ -68,6 +73,7 @@ static OCR_BUSY: AtomicBool = AtomicBool::new(false);
 /// IDs der registrierten Tastenkürzel.
 static SPEAK_HOTKEY: AtomicU32 = AtomicU32::new(0);
 static OCR_HOTKEY: AtomicU32 = AtomicU32::new(0);
+static SNIP_HOTKEY: AtomicU32 = AtomicU32::new(0);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -77,8 +83,11 @@ fn main() {
         Some(popup::remote::ARG) => return popup::remote::serve(),
         Some(update::INSTALL_ARG) => return update::install(&args[1..]),
         Some(update::CHECK_ARG) => return update::check_now(),
+        Some(screenshot::CAPTURE_ARG) => return screenshot::run_capture(&args[1..]),
+        Some(screenshot::EDIT_ARG) => return screenshot::run_editor(&args[1..]),
+        Some(screenshot::PIN_ARG) => return screenshot::run_pin(&args[1..]),
         Some(popup::demo::ARG) => return popup::demo::run(args.get(1).map(String::as_str)),
-        Some(shell_menu::INSTALL_ARG) => return report(shell_menu::sync(Settings::load().context_menu)),
+        Some(shell_menu::INSTALL_ARG) => return report(shell_menu::sync(&Settings::load())),
         Some(shell_menu::UNINSTALL_ARG) => {
             toast::unregister();
             return report(shell_menu::uninstall());
@@ -106,6 +115,8 @@ fn main() {
             Command::SpeakSelection
         } else if event.id == OCR_HOTKEY.load(Ordering::SeqCst) {
             Command::OcrSnip
+        } else if event.id == SNIP_HOTKEY.load(Ordering::SeqCst) {
+            Command::Snip(0)
         } else {
             return;
         };
@@ -116,6 +127,10 @@ fn main() {
     let speak_item = MenuItem::new("", true, None);
     let snip_item = MenuItem::new("", true, None);
     let clip_item = MenuItem::new("Text aus Bild in Zwischenablage kopieren", true, None);
+    let shot_item = MenuItem::new("", true, None);
+    let shot_delay_item = MenuItem::new("Screenshot in 5 Sekunden", true, None);
+    let editor_item = MenuItem::new("Bild öffnen und bearbeiten …", true, None);
+    let editor_clip_item = MenuItem::new("Bild aus Zwischenablage bearbeiten", true, None);
     let convert_item = MenuItem::new("Bilder konvertieren / verkleinern …", true, None);
     let settings_item = MenuItem::new("Einstellungen …", true, None);
     let log_item = MenuItem::new("Fehlerprotokoll öffnen", true, None);
@@ -127,6 +142,11 @@ fn main() {
         &speak_item,
         &snip_item,
         &clip_item,
+        &PredefinedMenuItem::separator(),
+        &shot_item,
+        &shot_delay_item,
+        &editor_item,
+        &editor_clip_item,
         &convert_item,
         &PredefinedMenuItem::separator(),
         &settings_item,
@@ -140,6 +160,10 @@ fn main() {
         (speak_item.id().clone(), Command::SpeakSelection),
         (snip_item.id().clone(), Command::OcrSnip),
         (clip_item.id().clone(), Command::OcrClipboard),
+        (shot_item.id().clone(), Command::Snip(0)),
+        (shot_delay_item.id().clone(), Command::Snip(5)),
+        (editor_item.id().clone(), Command::OpenEditor { clipboard: false }),
+        (editor_clip_item.id().clone(), Command::OpenEditor { clipboard: true }),
         (convert_item.id().clone(), Command::OpenConverter),
         (settings_item.id().clone(), Command::OpenSettings),
         (log_item.id().clone(), Command::OpenLog),
@@ -158,7 +182,7 @@ fn main() {
         .with_icon(icon::crab_icon())
         .build()
         .expect("Tray-Icon konnte nicht erstellt werden");
-    update_labels(&settings, &tray, &speak_item, &snip_item);
+    update_labels(&settings, &tray, &speak_item, &snip_item, &shot_item);
 
     // Einmal pro Sekunde nachsehen, ob der Dialog die Einstellungen geändert hat.
     let mut settings_modified = settings::modified();
@@ -177,9 +201,10 @@ fn main() {
                     let new_settings = Settings::load();
                     if new_settings.hotkey_speak != settings.hotkey_speak
                         || new_settings.hotkey_ocr != settings.hotkey_ocr
+                        || new_settings.hotkey_snip != settings.hotkey_snip
                     {
                         register_hotkeys(&hotkeys, &new_settings, &mut registered);
-                        update_labels(&new_settings, &tray, &speak_item, &snip_item);
+                        update_labels(&new_settings, &tray, &speak_item, &snip_item, &shot_item);
                     }
                     settings = new_settings;
                     let _ = tx.send(Command::SettingsChanged);
@@ -202,6 +227,7 @@ fn register_hotkeys(manager: &GlobalHotKeyManager, settings: &Settings, register
     for (text, slot) in [
         (&settings.hotkey_speak, &SPEAK_HOTKEY),
         (&settings.hotkey_ocr, &OCR_HOTKEY),
+        (&settings.hotkey_snip, &SNIP_HOTKEY),
     ] {
         slot.store(0, Ordering::SeqCst);
         let key = match text.parse::<HotKey>() {
@@ -224,21 +250,26 @@ fn register_hotkeys(manager: &GlobalHotKeyManager, settings: &Settings, register
     }
 }
 
-fn update_labels(settings: &Settings, tray: &TrayIcon, speak_item: &MenuItem, snip_item: &MenuItem) {
+fn update_labels(settings: &Settings, tray: &TrayIcon, speak_item: &MenuItem, snip_item: &MenuItem, shot_item: &MenuItem) {
     let speak = hotkey_label(&settings.hotkey_speak);
     let ocr = hotkey_label(&settings.hotkey_ocr);
+    let shot = hotkey_label(&settings.hotkey_snip);
     speak_item.set_text(format!("Markierten Text vorlesen\t{speak}"));
     snip_item.set_text(format!("Text aus Bildausschnitt kopieren\t{ocr}"));
-    let _ = tray.set_tooltip(Some(format!("UtilityCrab – {speak} vorlesen, {ocr} Text aus Bild")));
+    shot_item.set_text(format!("Screenshot aufnehmen\t{shot}"));
+    let _ = tray.set_tooltip(Some(format!(
+        "UtilityCrab – {speak} vorlesen, {ocr} Text aus Bild, {shot} Screenshot"
+    )));
 }
 
 fn worker_loop(rx: mpsc::Receiver<Command>, main_thread: u32) {
     let mut speaker = tts::Speaker::new();
     let mut settings_window: Option<Child> = None;
+    let mut capture_window: Option<Child> = None;
     let settings = Settings::load();
     tts::preload(&settings);
     // Bei jedem Start eintragen, damit der Programmpfad nach einem Update stimmt.
-    report(shell_menu::sync(settings.context_menu));
+    report(shell_menu::sync(&settings));
     update::spawn_background_checks(|| Settings::load().auto_update);
 
     for cmd in rx {
@@ -246,12 +277,20 @@ fn worker_loop(rx: mpsc::Receiver<Command>, main_thread: u32) {
             Command::SpeakSelection => speak_selection(&mut speaker),
             Command::OcrSnip => spawn_ocr(ocr::snip_to_clipboard),
             Command::OcrClipboard => spawn_ocr(ocr::clipboard_image_to_clipboard),
+            Command::Snip(delay) => start_capture(&mut capture_window, delay),
+            Command::OpenEditor { clipboard } => {
+                let mut args = vec![screenshot::EDIT_ARG];
+                if clipboard {
+                    args.push(screenshot::CLIPBOARD_ARG);
+                }
+                spawn_self(&args).map(|_| ())
+            }
             Command::OpenSettings => open_settings(&mut settings_window),
             Command::OpenConverter => spawn_self(&[convert::CLI_ARG, "fenster"]).map(|_| ()),
             Command::SettingsChanged => {
                 let settings = Settings::load();
                 tts::preload(&settings);
-                shell_menu::sync(settings.context_menu)
+                shell_menu::sync(&settings)
             }
             Command::OpenLog => open_log(),
             Command::CheckUpdate => {
@@ -287,6 +326,24 @@ fn open_settings(window: &mut Option<Child>) -> Result<(), String> {
         }
     }
     *window = Some(spawn_self(&[SETTINGS_ARG])?);
+    Ok(())
+}
+
+/// Startet die Screenshot-Auswahl (höchstens eine gleichzeitig, sonst nimmt sie sich selbst auf).
+fn start_capture(window: &mut Option<Child>, delay: u32) -> Result<(), String> {
+    if let Some(child) = window {
+        if matches!(child.try_wait(), Ok(None)) {
+            return Ok(());
+        }
+    }
+    // Der Tray hat das Tastenkürzel empfangen und darf den Fokus weitergeben –
+    // sonst landet Esc in der Auswahl nicht beim richtigen Fenster.
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+    }
+    let delay = delay.to_string();
+    let mode = screenshot::Prefs::load().mode;
+    *window = Some(spawn_self(&[screenshot::CAPTURE_ARG, mode.id(), &delay])?);
     Ok(())
 }
 
