@@ -1,6 +1,11 @@
 //! Auswahl über dem eingefrorenen Bildschirm: Rechteck, Fenster, ganzer Bildschirm oder
 //! Freihand. Oben mittig eine Leiste zum Umschalten, am Mauszeiger eine Lupe mit Pixelfarbe.
 //! Rechnet intern in physischen Pixeln, damit es auf Monitoren mit Skalierung stimmt.
+//!
+//! Das Auswahlfenster liegt über allen Bildschirmen, hat für Windows aber nur eine
+//! Skalierung (die des Bildschirms, auf dem es größtenteils liegt). Deshalb wird die
+//! Skalierung von egui jedes Bild an den Bildschirm unter der Maus angepasst – sonst
+//! wären Leiste und Lupe auf einem Bildschirm mit anderer Skalierung zu groß oder zu klein.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -118,7 +123,9 @@ pub fn run(mode: Option<CaptureMode>, delay: Duration) {
                 Ok(RawWindowHandle::Win32(h)) => Some(HWND(h.hwnd.get() as *mut _)),
                 _ => None,
             };
-            Ok(Box::new(Overlay::new(&cc.egui_ctx, screen, prefs, hwnd, shared)))
+            // Strg+Plus/Minus würde mit der Skalierung pro Bildschirm kollidieren.
+            cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+            Ok(Box::new(Overlay::new(screen, area, prefs, hwnd, shared)))
         }),
     );
     if let Err(e) = outcome {
@@ -179,12 +186,19 @@ fn finish(image: RgbaImage) {
 
 struct Overlay {
     screen: Screen,
-    texture: egui::TextureHandle,
+    /// Lage des Bildes (= des Fensters) auf dem virtuellen Bildschirm.
+    area: PxRect,
+    /// Erst im ersten Bild hochgeladen: Beim Erstellen der App kennt egui die echte
+    /// Texturgrenze der Grafikkarte noch nicht (nur den Standard 2048) und würde das
+    /// Bildschirmfoto mehrerer Monitore unnötig verkleinern – also unscharf machen.
+    texture: Option<egui::TextureHandle>,
     mode: CaptureMode,
     prefs: Prefs,
     hwnd: Option<HWND>,
     /// Bis das Fenster sicher über allen Bildschirmen liegt (Windows passt es bei DPI-Wechseln an).
     placement_checks: u32,
+    /// Wo zuletzt eine Maustaste gedrückt wurde (physische Pixel).
+    press_px: Option<Pos2>,
     drag_start: Option<Pos2>,
     drag_now: Option<Pos2>,
     lasso: Vec<Pos2>,
@@ -192,26 +206,51 @@ struct Overlay {
 }
 
 impl Overlay {
-    fn new(
-        ctx: &egui::Context,
-        screen: Screen,
-        prefs: Prefs,
-        hwnd: Option<HWND>,
-        result: Arc<Mutex<Option<RgbaImage>>>,
-    ) -> Self {
-        let max = ctx.input(|i| i.max_texture_side) as u32;
-        let (texture, _) = upload(ctx, "bildschirm", &screen.image, max);
+    fn new(screen: Screen, area: PxRect, prefs: Prefs, hwnd: Option<HWND>, result: Arc<Mutex<Option<RgbaImage>>>) -> Self {
         Self {
             screen,
-            texture,
+            area,
+            texture: None,
             mode: prefs.mode,
             prefs,
             hwnd,
             placement_checks: 30,
+            press_px: None,
             drag_start: None,
             drag_now: None,
             lasso: Vec::new(),
             result,
+        }
+    }
+
+    fn texture_id(&mut self, ctx: &egui::Context) -> egui::TextureId {
+        self.texture
+            .get_or_insert_with(|| {
+                let max = ctx.input(|i| i.max_texture_side) as u32;
+                upload(ctx, "bildschirm", &self.screen.image, max).0
+            })
+            .id()
+    }
+
+    /// Mauszeiger in Bildpixeln, direkt von Windows. egui kennt die Position nur in
+    /// Punkten, und die passen nach einem Skalierungswechsel erst wieder, wenn sich
+    /// die Maus bewegt.
+    fn cursor_px(&self) -> Option<Pos2> {
+        capture::cursor_pos().map(|(x, y)| pos2((x - self.area.x) as f32, (y - self.area.y) as f32))
+    }
+
+    /// Skalierung des Bildschirms unter der Maus übernehmen. Nicht während gedrückter
+    /// Maustaste, damit sich eine laufende Auswahl nicht unter der Hand verschiebt.
+    fn follow_monitor_scale(&self, ctx: &egui::Context) {
+        if ctx.input(|i| i.pointer.any_down()) {
+            return;
+        }
+        let Some((x, y)) = capture::cursor_pos() else {
+            return;
+        };
+        let target = capture::scale_at(x, y);
+        if (ctx.pixels_per_point() - target).abs() > 0.001 {
+            ctx.set_pixels_per_point(target);
         }
     }
 
@@ -308,7 +347,13 @@ impl eframe::App for Overlay {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.place_window();
+        self.follow_monitor_scale(&ctx);
         let ppp = ctx.pixels_per_point();
+        let cursor_px = self.cursor_px();
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            self.press_px = cursor_px;
+        }
+        let texture = self.texture_id(&ctx);
         let to_pt = |p: Pos2| pos2(p.x / ppp, p.y / ppp);
         let rect_pt = |r: PxRect| Rect::from_min_size(pos2(r.x as f32, r.y as f32) / ppp, vec2(r.w as f32, r.h as f32) / ppp);
         let (w, h) = self.screen.image.dimensions();
@@ -329,9 +374,10 @@ impl eframe::App for Overlay {
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
             let response = ui.interact(full, egui::Id::unique("auswahl"), Sense::click_and_drag());
             let painter = ui.painter().clone();
-            painter.image(self.texture.id(), full, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+            painter.image(texture, full, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
 
-            let pointer_px = response.hover_pos().or(ctx.pointer_latest_pos()).map(|p| pos2(p.x * ppp, p.y * ppp));
+            let pointer_px = cursor_px
+                .or_else(|| response.hover_pos().or(ctx.pointer_latest_pos()).map(|p| pos2(p.x * ppp, p.y * ppp)));
             let dim = Color32::from_black_alpha(110);
             let mut highlight: Option<PxRect> = None;
             let mut magnifier = false;
@@ -341,7 +387,7 @@ impl eframe::App for Overlay {
                     if response.drag_started() {
                         // Ab dem Klickpunkt, nicht erst ab der Zieh-Schwelle.
                         let origin = ctx.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
-                        self.drag_start = origin.map(|p| pos2(p.x * ppp, p.y * ppp));
+                        self.drag_start = self.press_px.or(origin.map(|p| pos2(p.x * ppp, p.y * ppp)));
                     }
                     if response.dragged() {
                         self.drag_now = pointer_px;
@@ -401,8 +447,9 @@ impl eframe::App for Overlay {
                 CaptureMode::Freeform => {
                     if response.drag_started() {
                         self.lasso.clear();
-                        if let Some(p) = ctx.input(|i| i.pointer.press_origin()) {
-                            self.lasso.push(pos2(p.x * ppp, p.y * ppp));
+                        let origin = ctx.input(|i| i.pointer.press_origin()).map(|p| pos2(p.x * ppp, p.y * ppp));
+                        if let Some(p) = self.press_px.or(origin) {
+                            self.lasso.push(p);
                         }
                     }
                     if response.dragged() {
@@ -443,26 +490,25 @@ impl eframe::App for Overlay {
 
             if magnifier {
                 if let Some(p) = pointer_px {
-                    self.magnifier(&painter, p, ppp, full);
+                    self.magnifier(&painter, texture, p, ppp, full);
                 }
             }
             ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         });
 
-        self.toolbar(&ctx, full);
+        self.toolbar(&ctx, full, cursor_px);
         ctx.request_repaint_after(Duration::from_millis(16));
     }
 }
 
 impl Overlay {
-    fn toolbar(&mut self, ctx: &egui::Context, full: Rect) {
+    fn toolbar(&mut self, ctx: &egui::Context, full: Rect, cursor_px: Option<Pos2>) {
         let mut chosen = None;
         let mut close = false;
         let mut bar_rect = Rect::NOTHING;
         // Auf dem Bildschirm mit der Maus, sonst dem ersten.
-        let monitor = ctx
-            .pointer_latest_pos()
-            .map(|p| p * ctx.pixels_per_point())
+        let monitor = cursor_px
+            .or_else(|| ctx.pointer_latest_pos().map(|p| p * ctx.pixels_per_point()))
             .and_then(|p| self.monitor_at(p))
             .or_else(|| self.screen.monitors.first().copied());
         let ppp = ctx.pixels_per_point();
@@ -527,7 +573,7 @@ impl Overlay {
     }
 
     /// Lupe neben dem Mauszeiger: vergrößerte Pixel, Fadenkreuz, Position und Farbe.
-    fn magnifier(&self, painter: &egui::Painter, p: Pos2, ppp: f32, full: Rect) {
+    fn magnifier(&self, painter: &egui::Painter, texture: egui::TextureId, p: Pos2, ppp: f32, full: Rect) {
         let (w, h) = self.screen.image.dimensions();
         let px = (p.x.floor() as i64).clamp(0, w as i64 - 1) as u32;
         let py = (p.y.floor() as i64).clamp(0, h as i64 - 1) as u32;
@@ -549,7 +595,7 @@ impl Overlay {
             pos2((px as f32 + 0.5 + half) / w as f32, (py as f32 + 0.5 + half) / h as f32),
         );
         painter.rect_filled(rect.expand(3.0), CornerRadius::same(6), ui_kit::GROUP_BG);
-        painter.image(self.texture.id(), rect, uv, Color32::WHITE);
+        painter.image(texture, rect, uv, Color32::WHITE);
         let cell = size / CELLS;
         let center = Rect::from_center_size(rect.center(), vec2(cell, cell));
         painter.rect_stroke(center, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Outside);

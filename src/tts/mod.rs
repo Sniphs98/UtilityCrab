@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
-use whatlang::Lang;
 use windows::core::{Interface, HSTRING};
 use windows::Media::Core::MediaSource;
 use windows::Media::Playback::{MediaPlaybackItem, MediaPlaybackList, MediaPlaybackState, MediaPlayer};
@@ -210,16 +209,14 @@ fn stream(
     player: &MediaPlayer,
     job: &Job,
 ) -> Result<(), String> {
-    let text_lang = detect_language(text);
-    for (i, chunk) in chunk_text(text, MAX_CHUNK_LEN).iter().enumerate() {
+    for (i, (chunk, lang)) in chunk_text(text, MAX_CHUNK_LEN).iter().enumerate() {
         if job.cancel.load(Ordering::SeqCst) {
             break;
         }
-        // Pro Abschnitt erkennen, damit z. B. ein englischer Satz im deutschen Text passend klingt.
         let request = Request {
             voice,
             speed,
-            lang: detect_language(chunk).or(text_lang),
+            lang: *lang,
             auto_language,
         };
         let audio = provider.synthesize(chunk, &request)?;
@@ -298,52 +295,11 @@ pub fn apply_pronunciations(text: &str, entries: &[Pronunciation]) -> String {
     out
 }
 
-/// Erkennt die Sprache des Textes (ISO 639-1), sofern die Erkennung sicher ist.
-fn detect_language(text: &str) -> Option<&'static str> {
-    let info = whatlang::detect(text).filter(|i| i.is_reliable())?;
-    Some(match info.lang() {
-        Lang::Deu => "de",
-        Lang::Eng => "en",
-        Lang::Fra => "fr",
-        Lang::Spa => "es",
-        Lang::Ita => "it",
-        Lang::Por => "pt",
-        Lang::Nld => "nl",
-        Lang::Pol => "pl",
-        Lang::Ces => "cs",
-        Lang::Slk => "sk",
-        Lang::Slv => "sl",
-        Lang::Hrv => "hr",
-        Lang::Hun => "hu",
-        Lang::Ron => "ro",
-        Lang::Bul => "bg",
-        Lang::Ell => "el",
-        Lang::Rus => "ru",
-        Lang::Ukr => "uk",
-        Lang::Tur => "tr",
-        Lang::Swe => "sv",
-        Lang::Dan => "da",
-        Lang::Fin => "fi",
-        Lang::Est => "et",
-        Lang::Lit => "lt",
-        Lang::Lav => "lv",
-        Lang::Ind => "id",
-        Lang::Vie => "vi",
-        Lang::Hin => "hi",
-        Lang::Ara => "ar",
-        Lang::Kor => "ko",
-        Lang::Jpn => "ja",
-        _ => return None,
-    })
-}
-
-/// Zerlegt Text in Abschnitte von höchstens `max_len` Bytes, bevorzugt an Satzenden.
-/// Der erste Satz ist ein eigener Abschnitt, damit das Vorlesen schnell beginnt.
-fn chunk_text(text: &str, max_len: usize) -> Vec<String> {
+/// Zerlegt Text in Sätze; überlange Sätze werden notfalls zwischen zwei Wörtern getrennt.
+fn split_sentences(text: &str, max_len: usize) -> Vec<String> {
     let mut sentences = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
-        // Überlange Sätze notfalls zwischen zwei Wörtern trennen.
         if !current.is_empty() && current.len() + 1 + word.len() > max_len {
             sentences.push(std::mem::take(&mut current));
         }
@@ -358,25 +314,45 @@ fn chunk_text(text: &str, max_len: usize) -> Vec<String> {
     if !current.is_empty() {
         sentences.push(current);
     }
+    sentences
+}
 
-    let mut chunks = Vec::new();
+/// Zerlegt Text in Abschnitte von höchstens `max_len` Bytes, bevorzugt an Satzenden, jeweils
+/// mit der erkannten Sprache (ISO 639-1).
+///
+/// Der erste Satz ist ein eigener Abschnitt, damit das Vorlesen schnell beginnt. Sätze in
+/// verschiedenen Sprachen landen nie im selben Abschnitt, damit z. B. ein englischer Satz
+/// in einem deutschen Text auch mit einer englischen Stimme gelesen wird.
+fn chunk_text(text: &str, max_len: usize) -> Vec<(String, Option<&'static str>)> {
+    let mut chunks: Vec<(String, Option<&'static str>)> = Vec::new();
     let mut current = String::new();
-    for sentence in sentences {
-        if !current.is_empty() && current.len() + 1 + sentence.len() > max_len {
-            chunks.push(std::mem::take(&mut current));
+    let mut current_lang = None;
+    for sentence in split_sentences(text, max_len) {
+        // Kurze Sätze ohne erkennbare Sprache („OK.“) passen zu jedem Abschnitt.
+        let lang = crate::lang::detect(&sentence);
+        let switches_language = lang.is_some() && current_lang.is_some() && lang != current_lang;
+        if !current.is_empty() && (switches_language || current.len() + 1 + sentence.len() > max_len) {
+            chunks.push((std::mem::take(&mut current), current_lang.take()));
         }
         if !current.is_empty() {
             current.push(' ');
         }
         current.push_str(&sentence);
+        current_lang = current_lang.or(lang);
         if chunks.is_empty() {
-            chunks.push(std::mem::take(&mut current));
+            chunks.push((std::mem::take(&mut current), current_lang.take()));
         }
     }
     if !current.is_empty() {
-        chunks.push(current);
+        chunks.push((current, current_lang));
     }
+
+    // Abschnitte ohne eigene Sprache bekommen die des ganzen Textes.
+    let text_lang = crate::lang::detect(text);
     chunks
+        .into_iter()
+        .map(|(chunk, lang)| (chunk, lang.or(text_lang)))
+        .collect()
 }
 
 /// Verpackt Samples als WAV (16 Bit, mono) in einen Speicher-Stream.
@@ -427,12 +403,13 @@ mod tests {
     #[test]
     fn chunks_respect_max_len() {
         let text = "Erster Satz. Zweiter Satz ist etwas länger! Dritter?";
+        let texts = |chunks: Vec<(String, Option<&str>)>| chunks.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
         assert_eq!(
-            chunk_text(text, 1000),
+            texts(chunk_text(text, 1000)),
             vec!["Erster Satz.", "Zweiter Satz ist etwas länger! Dritter?"]
         );
         assert_eq!(chunk_text(text, 35).len(), 3);
-        assert!(chunk_text(text, 20).iter().all(|c| c.len() <= 20));
+        assert!(chunk_text(text, 20).iter().all(|(c, _)| c.len() <= 20));
     }
 
     #[test]
@@ -440,8 +417,25 @@ mod tests {
         let text = "Heute habe ich ein langes Gespräch mit meinem Kollegen über das Projekt geführt. \
                     The meeting was really productive and everyone agreed on the next steps.";
         let chunks = chunk_text(text, MAX_CHUNK_LEN);
-        assert_eq!(detect_language(&chunks[0]), Some("de"));
-        assert_eq!(detect_language(&chunks[1]), Some("en"));
+        assert_eq!(chunks[0].1, Some("de"));
+        assert_eq!(chunks[1].1, Some("en"));
+    }
+
+    #[test]
+    fn languages_are_never_mixed_in_one_chunk() {
+        let text = "Hallo. Wie geht es dir heute? Thanks, I am fine and the weather is great. \
+                    Das freut mich sehr. OK.";
+        let chunks = chunk_text(text, MAX_CHUNK_LEN);
+        let expected = [
+            ("Hallo.", Some("de")),
+            ("Wie geht es dir heute?", Some("de")),
+            ("Thanks, I am fine and the weather is great.", Some("en")),
+            ("Das freut mich sehr. OK.", Some("de")),
+        ];
+        assert_eq!(chunks.len(), expected.len(), "{chunks:?}");
+        for ((chunk, lang), (want_chunk, want_lang)) in chunks.iter().zip(expected) {
+            assert_eq!((chunk.as_str(), *lang), (want_chunk, want_lang));
+        }
     }
 
     #[test]

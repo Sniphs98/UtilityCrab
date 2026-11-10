@@ -253,6 +253,9 @@ pub struct Editor {
     view: Option<View>,
     /// Ansicht automatisch einpassen (bis der Benutzer selbst zoomt).
     fit: bool,
+    /// Skalierung im letzten Bild; ändert sie sich (Fenster auf anderen Bildschirm gezogen),
+    /// wird der Zoom so angepasst, dass das Bild in Bildschirmpixeln gleich groß bleibt.
+    last_ppp: f32,
     image_size: (u32, u32),
     composite: Option<Canvas>,
     composite_revision: u64,
@@ -292,6 +295,7 @@ impl Editor {
             settings: Settings::load(),
             view: None,
             fit: true,
+            last_ppp: 0.0,
             image_size: (0, 0),
             composite: None,
             composite_revision: u64::MAX,
@@ -919,6 +923,14 @@ impl Editor {
     fn canvas(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let area = ui.max_rect();
         let ppp = ctx.pixels_per_point();
+        if self.last_ppp > 0.0 && (ppp - self.last_ppp).abs() > 0.001 {
+            if let Some(view) = &mut self.view {
+                let ratio = self.last_ppp / ppp;
+                view.scale *= ratio;
+                view.offset = (view.offset.to_vec2() * ratio).to_pos2();
+            }
+        }
+        self.last_ppp = ppp;
         let (w, h) = self.image_size;
         let size = vec2(w as f32, h as f32);
         if self.fit || self.view.is_none() {

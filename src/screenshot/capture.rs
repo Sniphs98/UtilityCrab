@@ -4,16 +4,18 @@
 
 use image::RgbaImage;
 use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
     GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
-    DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFO, SRCCOPY,
+    DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromPoint, SRCCOPY,
 };
-use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::UI::HiDpi::{
+    GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetSystemMetrics, GetWindowTextW, IsIconic, IsWindowVisible, SM_CXVIRTUALSCREEN,
+    EnumWindows, GetClassNameW, GetCursorPos, GetSystemMetrics, GetWindowTextW, IsIconic, IsWindowVisible, SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
@@ -65,6 +67,26 @@ pub fn virtual_screen() -> PxRect {
             w: GetSystemMetrics(SM_CXVIRTUALSCREEN),
             h: GetSystemMetrics(SM_CYVIRTUALSCREEN),
         }
+    }
+}
+
+/// Mauszeiger in physischen Pixeln (Bildschirmkoordinaten, nicht relativ zum virtuellen Bildschirm).
+pub fn cursor_pos() -> Option<(i32, i32)> {
+    let mut p = POINT::default();
+    unsafe { GetCursorPos(&mut p).ok()? };
+    Some((p.x, p.y))
+}
+
+/// Windows-Skalierung (1.0 = 100 %, 1.5 = 150 %) des Bildschirms an einem Punkt
+/// in physischen Bildschirmkoordinaten.
+pub fn scale_at(x: i32, y: i32) -> f32 {
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_err() || dpi_x == 0 {
+            return 1.0;
+        }
+        dpi_x as f32 / 96.0
     }
 }
 
