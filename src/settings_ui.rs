@@ -693,21 +693,38 @@ impl SettingsApp {
             let default_folder = crate::screenshot::default_folder();
             g.custom(|ui| {
                 ui.label(RichText::new("Ordner für Screenshots").color(TEXT));
+                ui.label(
+                    RichText::new("Hier landen automatisch gespeicherte Screenshots; „Speichern unter“ im Editor schlägt ihn ebenfalls vor.")
+                        .font(regular(SMALL_SIZE))
+                        .color(TEXT_WEAK),
+                );
+                let custom = !self.settings.snip_folder.trim().is_empty();
+                let current = if custom {
+                    std::path::PathBuf::from(self.settings.snip_folder.trim())
+                } else {
+                    default_folder.clone()
+                };
                 ui.horizontal(|ui| {
-                    let width = ui.available_width() - 90.0;
+                    // Platz für die Knöpfe rechts lassen.
+                    let width = ui.available_width() - if custom { 260.0 } else { 175.0 };
                     ui.add(
                         egui::TextEdit::singleline(&mut self.settings.snip_folder)
-                            .hint_text(default_folder.display().to_string())
-                            .desired_width(width),
+                            .hint_text(format!("{} (Standard)", default_folder.display()))
+                            .desired_width(width.max(120.0)),
                     );
-                    if ui.button("Öffnen").clicked() {
-                        let folder = if self.settings.snip_folder.trim().is_empty() {
-                            default_folder.clone()
-                        } else {
-                            std::path::PathBuf::from(self.settings.snip_folder.trim())
-                        };
-                        let _ = std::fs::create_dir_all(&folder);
-                        let _ = std::process::Command::new("explorer").arg(folder).spawn();
+                    if ui.button("Durchsuchen …").clicked() {
+                        if let Some(folder) = crate::screenshot::pick_folder(&current) {
+                            // Wieder den Standard gewählt: leer lassen, dann folgt er z. B. einem neuen Benutzerprofil.
+                            self.settings.snip_folder =
+                                if folder == default_folder { String::new() } else { folder.display().to_string() };
+                        }
+                    }
+                    if ui.button("Öffnen").on_hover_text("Ordner im Explorer anzeigen").clicked() {
+                        let _ = std::fs::create_dir_all(&current);
+                        let _ = std::process::Command::new("explorer").arg(&current).spawn();
+                    }
+                    if custom && ui.button("Standard").on_hover_text("Zurück zu Bilder\\Screenshots").clicked() {
+                        self.settings.snip_folder.clear();
                     }
                 });
             });

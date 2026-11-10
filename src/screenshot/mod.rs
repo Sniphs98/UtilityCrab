@@ -53,8 +53,6 @@ pub struct Prefs {
     pub tool: String,
     pub styles: HashMap<String, Style>,
     pub redact_patterns: Vec<String>,
-    /// Ordner des zuletzt geöffneten oder gespeicherten Bildes.
-    pub last_dir: Option<PathBuf>,
 }
 
 impl Default for Prefs {
@@ -65,7 +63,6 @@ impl Default for Prefs {
             tool: "pfeil".into(),
             styles: HashMap::new(),
             redact_patterns: redact::default_selection(),
-            last_dir: None,
         }
     }
 }
@@ -114,6 +111,11 @@ pub fn run_pin(args: &[String]) {
         Some(path) => pin::run(PathBuf::from(path)),
         None => crate::report(Err("Anheften: keine Datei angegeben".into())),
     }
+}
+
+/// Ordnerauswahl von Windows (für die Einstellungen).
+pub fn pick_folder(initial: &std::path::Path) -> Option<PathBuf> {
+    export::pick_folder(initial)
 }
 
 /// Standardordner für automatisch gespeicherte Screenshots (für die Einstellungen).

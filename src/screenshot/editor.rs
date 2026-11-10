@@ -355,10 +355,6 @@ impl Editor {
         self.fit = true;
         self.view = None;
         self.preview = None;
-        if let Some(dir) = self.file.as_ref().and_then(|f| f.parent()) {
-            self.prefs.last_dir = Some(dir.to_path_buf());
-            self.prefs_dirty = true;
-        }
     }
 
     pub fn open(&mut self, path: &Path) {
@@ -449,12 +445,9 @@ impl Editor {
         };
         let suggestion = match &self.file {
             Some(file) => file.clone(),
+            // Neue Screenshots: im eingestellten Screenshot-Ordner vorschlagen.
             None => {
-                let dir = self
-                    .prefs
-                    .last_dir
-                    .clone()
-                    .unwrap_or_else(|| export::screenshot_folder(&self.settings));
+                let dir = export::screenshot_folder(&Settings::load());
                 let _ = std::fs::create_dir_all(&dir);
                 dir.join(export::default_name())
             }
@@ -466,10 +459,6 @@ impl Editor {
             Ok(()) => {
                 self.exported_revision = self.revision();
                 self.set_status(format!("Gespeichert: {}", path.display()), false);
-                if let Some(dir) = path.parent() {
-                    self.prefs.last_dir = Some(dir.to_path_buf());
-                    self.prefs_dirty = true;
-                }
                 self.file = Some(path);
             }
             Err(e) => self.report(Err(e)),

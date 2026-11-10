@@ -92,6 +92,36 @@ pub fn load(path: &Path) -> Result<RgbaImage, String> {
 // ---------------------------------------------------------------------------------------------
 // Windows-Dateidialoge
 
+/// Moderner „Ordner auswählen“-Dialog; `None`, wenn abgebrochen.
+pub fn pick_folder(initial: &Path) -> Option<PathBuf> {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, FOS_FORCEFILESYSTEM,
+        FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+    };
+    unsafe {
+        // Meist schon durch das Fenster initialisiert; dann ist das hier ein harmloser Zweitaufruf.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
+        let _ = dialog.SetTitle(&HSTRING::from("Ordner für Screenshots wählen"));
+        if initial.is_dir() {
+            if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(initial.as_os_str()), None) {
+                let _ = dialog.SetFolder(&item);
+            }
+        }
+        dialog.Show(None).ok()?;
+        let name = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = name.to_string().ok();
+        CoTaskMemFree(Some(name.0 as *const _));
+        path.map(PathBuf::from)
+    }
+}
+
 const OPEN_FILTER: &str = "Bilder\0*.png;*.jpg;*.jpeg;*.jfif;*.webp;*.bmp;*.gif;*.tif;*.tiff;*.ico;*.heic;*.heif;*.avif\0Alle Dateien\0*.*\0\0";
 const SAVE_FILTER: &str = "PNG-Bild\0*.png\0JPG-Bild\0*.jpg\0WebP-Bild\0*.webp\0BMP-Bild\0*.bmp\0\0";
 const SAVE_EXTENSIONS: [&str; 4] = ["png", "jpg", "webp", "bmp"];

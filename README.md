@@ -15,7 +15,7 @@
 ## Features
 
 - **Read aloud:** select text anywhere and press a hotkey. Speech starts after the first sentence is ready, and pressing the hotkey again stops it.
-- **Screenshots (Snipping Tool replacement):** press `Ctrl+Alt+A` (or use the tray menu) and pick a **rectangle**, a **window**, a **whole screen** or a **freeform** shape. A magnifier next to the cursor shows the pixels and their color; a single click in rectangle mode takes the window under the cursor. Delays of 3, 5 or 10 seconds are available. The screenshot is copied to the clipboard, optionally saved to `Pictures\Screenshots`, and opened in the editor.
+- **Screenshots (Snipping Tool replacement):** press `Ctrl+Alt+A` (or use the tray menu) and pick a **rectangle**, a **window**, a **whole screen** or a **freeform** shape. A magnifier next to the cursor shows the pixels and their color; a single click in rectangle mode takes the window under the cursor. Delays of 3, 5 or 10 seconds are available. The screenshot is copied to the clipboard, optionally saved to `Pictures\Screenshots` or a folder of your choice (Settings → Screenshot), and opened in the editor.
 - **Image editor:** edit screenshots or **existing photos** (open button / `Ctrl+O`, drag & drop, `Ctrl+V`, tray menu, or right-click an image in Explorer → **Mit UtilityCrab bearbeiten**). Tools:
   - pen, highlighter, eraser, arrow, line, rectangle, ellipse (filled or outlined, Shift for square/circle/45°), text (optionally on a colored box), numbered step markers 1, 2, 3 …
   - **redact** an area: pixelate, blur or black out
