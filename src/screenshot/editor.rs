@@ -595,6 +595,7 @@ impl Editor {
                     rect: f.rect.intersect(bounds),
                     mode: style.redact,
                     strength: style.width,
+                    soft: style.soft(),
                 }));
             }
         });
@@ -697,6 +698,18 @@ impl Editor {
         let Some(item) = self.tools.get(self.active).and_then(|t| t.as_ref()).and_then(|t| t.preview()) else {
             return;
         };
+        // Ein neues Spotlight ändert die gemeinsame Abdunklung aller Spotlights – dafür
+        // das ganze Bild mit ihm zusammen neu zusammensetzen.
+        if item.as_spotlight().is_some() {
+            if let Some(history) = &self.history {
+                let mut doc = history.doc.clone();
+                doc.items.push(item.box_clone());
+                let canvas = doc.compose();
+                let area = canvas.area().to_rect();
+                self.preview = Some((canvas_texture(ctx, "vorschau", &canvas), area));
+            }
+            return;
+        }
         let bounds = item.bounds().intersect(Rect::from_min_size(Pos2::ZERO, vec2(size.0 as f32, size.1 as f32)));
         if !bounds.is_positive() {
             return;
@@ -820,6 +833,40 @@ impl Editor {
                                     style.redact = mode;
                                 }
                             }
+                            ui.add_space(10.0);
+                        }
+                        Opt::SoftEdge => {
+                            if style.redact != RedactMode::Blur {
+                                continue;
+                            }
+                            let text = if style.soft_edge {
+                                format!("Weicher Rand: {} px ▾", style.softness.round())
+                            } else {
+                                "Harter Rand ▾".to_string()
+                            };
+                            let response = ui
+                                .button(text)
+                                .on_hover_text("Runde Ecken und ein nach außen auslaufender Rand");
+                            egui::Popup::menu(&response)
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                .show(|ui| {
+                                    ui.set_min_width(220.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Weicher Rand");
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            ui_kit::toggle(ui, &mut style.soft_edge);
+                                        });
+                                    });
+                                    ui.add_enabled_ui(style.soft_edge, |ui| {
+                                        ui.label(RichText::new("Weichheit").color(TEXT_WEAK));
+                                        ui.add(
+                                            egui::Slider::new(&mut style.softness, 2.0..=80.0)
+                                                .integer()
+                                                .suffix(" px")
+                                                .trailing_fill(true),
+                                        );
+                                    });
+                                });
                             ui.add_space(10.0);
                         }
                     }

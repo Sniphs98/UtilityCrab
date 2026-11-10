@@ -44,6 +44,8 @@ pub enum Opt {
     Width { label: &'static str, min: f32, max: f32 },
     Filled(&'static str),
     Redact,
+    /// Weiche Kante beim Weichzeichnen (Untermenü zum Einstellen/Abschalten).
+    SoftEdge,
 }
 
 pub trait Tool {
@@ -168,7 +170,7 @@ pub fn all() -> Vec<Option<Box<dyn Tool>>> {
             "Bereich aufziehen, der verpixelt, weichgezeichnet oder geschwärzt wird",
             Key::U,
             Glyph::Redact,
-            &[Opt::Redact, Opt::Width { label: "Stärke", min: 4.0, max: 40.0 }],
+            &[Opt::Redact, Opt::Width { label: "Stärke", min: 4.0, max: 40.0 }, Opt::SoftEdge],
             Style {
                 width: 12.0,
                 ..Style::default()
@@ -180,6 +182,7 @@ pub fn all() -> Vec<Option<Box<dyn Tool>>> {
                         rect,
                         mode: s.redact,
                         strength: s.width,
+                        soft: s.soft(),
                     }) as Box<dyn Annotation>
                 })
             },

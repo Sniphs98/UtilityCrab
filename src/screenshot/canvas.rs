@@ -82,12 +82,15 @@ impl Canvas {
         self.pixmap.stroke_path(path, &paint, &stroke, t, None);
     }
 
-    /// Füllt alles außer `path` (z. B. Spotlight).
-    pub fn fill_outside(&mut self, path: &Path, color: Color32) {
+    /// Füllt alles außer den `paths` (z. B. Spotlight) – in einem Zug, damit sich
+    /// überlappende Flächen nicht doppelt abdunkeln.
+    pub fn fill_outside(&mut self, paths: &[Path], color: Color32) {
         let Some(mut mask) = Mask::new(self.pixmap.width(), self.pixmap.height()) else {
             return;
         };
-        mask.fill_path(path, FillRule::Winding, true, self.transform());
+        for path in paths {
+            mask.fill_path(path, FillRule::Winding, true, self.transform());
+        }
         mask.invert();
         let paint = paint(color, BlendMode::SourceOver);
         let rect = tiny_skia::Rect::from_xywh(0.0, 0.0, self.pixmap.width() as f32, self.pixmap.height() as f32).unwrap();
@@ -178,6 +181,48 @@ impl Canvas {
                 let c = |v: f32| (v.round().clamp(0.0, 255.0) as u8).min(a);
                 data[(r.y - oy) as usize * width + y * width + (r.x - ox) as usize + x] =
                     PremultipliedColorU8::from_rgba(c(rr), c(g), c(b), a).unwrap_or(PremultipliedColorU8::TRANSPARENT);
+            }
+        }
+    }
+
+    /// Überblendet zurück zum `original`: innerhalb von `inner` (mit runden Ecken `corner`)
+    /// bleibt das jetzige Bild, außerhalb läuft es über `feather` Pixel weich ins Original aus.
+    pub fn blend_soft_edge(&mut self, original: &Canvas, inner: Rect, corner: f32, feather: f32) {
+        let Some(r) = original.area().intersect(&self.area()) else {
+            return;
+        };
+        let center = inner.center();
+        let half = inner.size() / 2.0;
+        let feather = feather.max(1.0);
+        let (ox, oy) = self.origin;
+        let width = self.pixmap.width() as usize;
+        let (sx, sy) = original.origin;
+        let src_width = original.pixmap.width() as usize;
+        let src = original.pixmap.pixels();
+        let data = self.pixmap.pixels_mut();
+        for y in r.y..r.y + r.h {
+            for x in r.x..r.x + r.w {
+                // Abstand zum abgerundeten Rechteck (innen ≤ 0).
+                let px = (x as f32 + 0.5 - center.x).abs() - half.x + corner;
+                let py = (y as f32 + 0.5 - center.y).abs() - half.y + corner;
+                let dist = vec2(px.max(0.0), py.max(0.0)).length() + px.max(py).min(0.0) - corner;
+                let t = (dist / feather).clamp(0.0, 1.0);
+                // Glatter Verlauf: 1 innen, 0 am äußeren Rand.
+                let w = 1.0 - t * t * (3.0 - 2.0 * t);
+                if w >= 1.0 {
+                    continue;
+                }
+                let o = src[(y - sy) as usize * src_width + (x - sx) as usize];
+                let d = &mut data[(y - oy) as usize * width + (x - ox) as usize];
+                let mix = |a: u8, b: u8| (a as f32 * w + b as f32 * (1.0 - w)).round() as u8;
+                let alpha = mix(d.alpha(), o.alpha());
+                *d = PremultipliedColorU8::from_rgba(
+                    mix(d.red(), o.red()).min(alpha),
+                    mix(d.green(), o.green()).min(alpha),
+                    mix(d.blue(), o.blue()).min(alpha),
+                    alpha,
+                )
+                .unwrap_or(*d);
             }
         }
     }
