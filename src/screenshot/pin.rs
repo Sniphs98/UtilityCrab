@@ -31,13 +31,12 @@ pub fn run(path: PathBuf) {
         options,
         Box::new(move |cc| {
             ui_kit::apply(&cc.egui_ctx);
-            let max = cc.egui_ctx.input(|i| i.max_texture_side) as u32;
-            let (texture, _) = upload(&cc.egui_ctx, "angeheftet", &image, max);
             Ok(Box::new(Pin {
                 image,
                 path,
-                texture,
+                texture: None,
                 zoom: None,
+                ppp: 0.0,
             }))
         }),
     );
@@ -49,16 +48,22 @@ pub fn run(path: PathBuf) {
 struct Pin {
     image: RgbaImage,
     path: PathBuf,
-    texture: egui::TextureHandle,
-    /// Bildschirmpunkte pro Bildpixel; `None` bis zum ersten Bild.
+    /// Erst im ersten Bild hochgeladen: Vorher kennt egui die Texturgrenze der
+    /// Grafikkarte nicht und würde große Bilder auf 2048 Pixel verkleinern.
+    texture: Option<egui::TextureHandle>,
+    /// Bildschirmpixel (physisch) pro Bildpixel; `None` bis zum ersten Bild. In Pixeln statt
+    /// Punkten, damit das Bild beim Wechsel auf einen anders skalierten Bildschirm gleich bleibt.
     zoom: Option<f32>,
+    /// Skalierung im letzten Bild, um Bildschirmwechsel zu bemerken.
+    ppp: f32,
 }
 
 impl Pin {
     fn resize(&self, ctx: &egui::Context) {
         if let Some(zoom) = self.zoom {
             let (w, h) = self.image.dimensions();
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(w as f32, h as f32) * zoom));
+            let points = vec2(w as f32, h as f32) * zoom / ctx.pixels_per_point();
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(points));
         }
     }
 }
@@ -70,17 +75,30 @@ impl eframe::App for Pin {
             // 1 Bildpixel = 1 Bildschirmpixel, höchstens 60 % des Bildschirms.
             let ppp = ctx.pixels_per_point();
             let (w, h) = self.image.dimensions();
-            let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(vec2(1600.0, 900.0));
+            let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(vec2(1600.0, 900.0)) * ppp;
             let fit = (monitor.x * 0.6 / w as f32).min(monitor.y * 0.6 / h as f32);
-            self.zoom = Some((1.0 / ppp).min(fit));
+            self.zoom = Some(fit.min(1.0));
+            self.ppp = ppp;
+            self.resize(&ctx);
+        } else if (ctx.pixels_per_point() - self.ppp).abs() > 0.001 {
+            // Auf einen Bildschirm mit anderer Skalierung gezogen: Windows hat das Fenster
+            // mitskaliert, das Bild soll aber scharf in seiner Pixelgröße bleiben.
+            self.ppp = ctx.pixels_per_point();
             self.resize(&ctx);
         }
+        let texture = self
+            .texture
+            .get_or_insert_with(|| {
+                let max = ctx.input(|i| i.max_texture_side) as u32;
+                upload(&ctx, "angeheftet", &self.image, max).0
+            })
+            .id();
 
         let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
             let rect = ui.max_rect();
             let response = ui.interact(rect, egui::Id::unique("angeheftet"), Sense::click_and_drag());
-            ui.painter().image(self.texture.id(), rect, Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
+            ui.painter().image(texture, rect, Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
             ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0, ui_kit::ACCENT), StrokeKind::Inside);
 
             if response.drag_started() {
@@ -92,7 +110,7 @@ impl eframe::App for Pin {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if response.hovered() && scroll != 0.0 {
                 if let Some(zoom) = &mut self.zoom {
-                    *zoom = (*zoom * (1.0 + scroll * 0.002)).clamp(0.05, 8.0);
+                    *zoom = (*zoom * (1.0 + scroll * 0.002)).clamp(0.05, 16.0);
                 }
                 self.resize(&ctx);
             }
@@ -110,7 +128,7 @@ impl eframe::App for Pin {
                         ui.close();
                     }
                     if ui.button("Originalgröße").clicked() {
-                        self.zoom = Some(1.0 / ctx.pixels_per_point());
+                        self.zoom = Some(1.0);
                         self.resize(&ctx);
                         ui.close();
                     }
