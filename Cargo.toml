@@ -2,7 +2,7 @@
 name = "utility_crab"
 version = "0.1.0"
 edition = "2021"
-description = "Kleines Windows-Tray-Tool: Text vorlesen und Text aus Bildern kopieren"
+description = "Kleines Windows-Tray-Tool: Text vorlesen, Text aus Bildern kopieren, Screenshots und Bilder konvertieren"
 
 [dependencies]
 tray-icon = "0.26"
@@ -20,6 +20,9 @@ webp = { version = "0.3", default-features = false }
 winreg = "0.56"
 rayon = "1"
 raw-window-handle = "0.6"
+tiny-skia = "0.11"
+ab_glyph = "0.2"
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl", "perf"] }
 
 [dependencies.windows]
 version = "0.62"
@@ -46,8 +49,11 @@ features = [
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ]
 

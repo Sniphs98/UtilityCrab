@@ -1,4 +1,5 @@
-//! Untermenü „Konvertieren“ im Explorer-Kontextmenü von Bilddateien.
+//! Explorer-Kontextmenü von Bilddateien: Untermenü „Konvertieren“ und
+//! „Mit UtilityCrab bearbeiten“ (öffnet den Bildeditor).
 //!
 //! Klassische Registry-Verben unter HKCU (keine Admin-Rechte nötig). Unter Windows 11
 //! erscheinen sie unter „Weitere Optionen anzeigen“ bzw. mit Umschalt+Rechtsklick.
@@ -14,6 +15,7 @@ pub const INSTALL_ARG: &str = "--kontextmenue-einrichten";
 pub const UNINSTALL_ARG: &str = "--kontextmenue-entfernen";
 
 const VERB: &str = "UtilityCrab";
+const EDIT_VERB: &str = "UtilityCrabBearbeiten";
 /// Trennlinie über dem Eintrag (ECF_SEPARATORBEFORE).
 const SEPARATOR_BEFORE: u32 = 0x20;
 
@@ -26,13 +28,35 @@ fn key_path(ext: &str) -> String {
     format!(r"Software\Classes\SystemFileAssociations\.{ext}\shell\{VERB}")
 }
 
-/// Trägt das Menü ein bzw. entfernt es, passend zur Einstellung.
-pub fn sync(enabled: bool) -> Result<(), String> {
-    if enabled {
-        install()
-    } else {
-        uninstall()
+fn edit_key_path(ext: &str) -> String {
+    format!(r"Software\Classes\SystemFileAssociations\.{ext}\shell\{EDIT_VERB}")
+}
+
+/// Trägt die Menüs ein bzw. entfernt sie, passend zu den Einstellungen.
+pub fn sync(settings: &crate::settings::Settings) -> Result<(), String> {
+    let convert = if settings.context_menu { install() } else { remove(key_path) };
+    let edit = if settings.edit_context_menu { install_edit() } else { remove(edit_key_path) };
+    convert.and(edit)
+}
+
+/// „Mit UtilityCrab bearbeiten“ direkt im Kontextmenü (ohne Untermenü).
+fn install_edit() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = exe.display();
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let fail = |e: std::io::Error| format!("Kontextmenü eintragen: {e}");
+    for ext in INPUT_EXTENSIONS {
+        let path = edit_key_path(ext);
+        let _ = hkcu.delete_subkey_all(&path);
+        let (root, _) = hkcu.create_subkey(&path).map_err(fail)?;
+        root.set_value("MUIVerb", &"Mit UtilityCrab bearbeiten").map_err(fail)?;
+        root.set_value("Icon", &format!("\"{exe}\",0")).map_err(fail)?;
+        let (command, _) = root.create_subkey("command").map_err(fail)?;
+        command
+            .set_value("", &format!("\"{exe}\" {} \"%1\"", crate::screenshot::EDIT_ARG))
+            .map_err(fail)?;
     }
+    Ok(())
 }
 
 pub fn install() -> Result<(), String> {
@@ -78,10 +102,15 @@ pub fn install() -> Result<(), String> {
     Ok(())
 }
 
+/// Entfernt beide Menüs (Deinstallation).
 pub fn uninstall() -> Result<(), String> {
+    remove(key_path).and(remove(edit_key_path))
+}
+
+fn remove(path_of: fn(&str) -> String) -> Result<(), String> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     for ext in INPUT_EXTENSIONS {
-        match hkcu.delete_subkey_all(key_path(ext)) {
+        match hkcu.delete_subkey_all(path_of(ext)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("Kontextmenü entfernen: {e}")),

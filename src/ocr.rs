@@ -2,7 +2,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
-use windows::Media::Ocr::OcrEngine;
+use windows::Media::Ocr::{OcrEngine, OcrResult};
 use windows::Storage::Streams::DataWriter;
 
 use crate::clipboard;
@@ -42,10 +42,48 @@ pub fn clipboard_image_to_clipboard() -> Result<String, String> {
 }
 
 /// Texterkennung mit der eingebauten Windows-OCR (Sprachen aus dem Benutzerprofil).
-fn recognize(width: u32, height: u32, rgba: &[u8]) -> windows::core::Result<String> {
+pub fn recognize(width: u32, height: u32, rgba: &[u8]) -> windows::core::Result<String> {
+    let (result, _) = run_engine(width, height, rgba)?;
+    let lines: Vec<String> = result
+        .Lines()?
+        .into_iter()
+        .filter_map(|line| line.Text().ok())
+        .map(|t| t.to_string())
+        .collect();
+    Ok(lines.join("\r\n"))
+}
+
+/// Ein erkanntes Wort mit seiner Lage im Bild (x, y, Breite, Höhe in Pixeln des Originals).
+#[derive(Debug, Clone)]
+pub struct Word {
+    pub text: String,
+    pub rect: [f32; 4],
+}
+
+/// Wie [`recognize`], aber mit Wortpositionen, zeilenweise (z. B. zum Unkenntlichmachen).
+pub fn recognize_words(width: u32, height: u32, rgba: &[u8]) -> windows::core::Result<Vec<Vec<Word>>> {
+    let (result, scale) = run_engine(width, height, rgba)?;
+    let mut lines = Vec::new();
+    for line in result.Lines()? {
+        let mut words = Vec::new();
+        for word in line.Words()? {
+            let r = word.BoundingRect()?;
+            words.push(Word {
+                text: word.Text()?.to_string(),
+                rect: [r.X / scale, r.Y / scale, r.Width / scale, r.Height / scale],
+            });
+        }
+        lines.push(words);
+    }
+    Ok(lines)
+}
+
+/// Lässt die OCR laufen; zurück kommt auch der Verkleinerungsfaktor (1.0 = Originalgröße).
+fn run_engine(width: u32, height: u32, rgba: &[u8]) -> windows::core::Result<(OcrResult, f32)> {
     // Zu große Bilder lehnt die OCR ab, also vorher verkleinern.
     let max = OcrEngine::MaxImageDimension()?;
-    let (mut bgra, width, height) = shrink_to_fit(rgba.to_vec(), width, height, max);
+    let (mut bgra, new_width, new_height) = shrink_to_fit(rgba.to_vec(), width, height, max);
+    let scale = new_width as f32 / width.max(1) as f32;
 
     // Windows erwartet BGRA statt RGBA.
     for px in bgra.chunks_exact_mut(4) {
@@ -58,20 +96,12 @@ fn recognize(width: u32, height: u32, rgba: &[u8]) -> windows::core::Result<Stri
     let bitmap = SoftwareBitmap::CreateCopyFromBuffer(
         &buffer,
         BitmapPixelFormat::Bgra8,
-        width as i32,
-        height as i32,
+        new_width as i32,
+        new_height as i32,
     )?;
 
     let engine = OcrEngine::TryCreateFromUserProfileLanguages()?;
-    let result = engine.RecognizeAsync(&bitmap)?.join()?;
-
-    let lines: Vec<String> = result
-        .Lines()?
-        .into_iter()
-        .filter_map(|line| line.Text().ok())
-        .map(|t| t.to_string())
-        .collect();
-    Ok(lines.join("\r\n"))
+    Ok((engine.RecognizeAsync(&bitmap)?.join()?, scale))
 }
 
 /// Verkleinert ein 4-Kanal-Bild (Mittelwert über Pixelblöcke), sodass keine Seite `max` überschreitet.

@@ -351,6 +351,7 @@ pub enum NavIcon {
     Text,
     Keyboard,
     Convert,
+    Camera,
     Info,
 }
 
@@ -413,6 +414,12 @@ fn nav_glyph(painter: &Painter, rect: Rect, icon: NavIcon) {
                 painter.circle_filled(c + vec2(x, -1.5), 0.8, white);
             }
             painter.line_segment([c + vec2(-3.0, 2.0), c + vec2(3.0, 2.0)], Stroke::new(1.2, white));
+        }
+        NavIcon::Camera => {
+            let body = Rect::from_center_size(c + vec2(0.0, 1.0), vec2(14.0, 10.0));
+            painter.rect_stroke(body, CornerRadius::same(2), Stroke::new(1.3, white), egui::StrokeKind::Middle);
+            painter.rect_filled(Rect::from_center_size(c + vec2(-2.0, -4.5), vec2(5.0, 2.0)), CornerRadius::same(1), white);
+            painter.circle_stroke(c + vec2(0.0, 1.0), 2.8, Stroke::new(1.3, white));
         }
         NavIcon::Info => {
             painter.circle_filled(c + vec2(0.0, -4.5), 1.4, white);

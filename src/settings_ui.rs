@@ -71,16 +71,18 @@ enum Tab {
     Models,
     Pronunciation,
     Hotkeys,
+    Screenshot,
     Convert,
     About,
 }
 
 impl Tab {
-    const ALL: [Tab; 6] = [
+    const ALL: [Tab; 7] = [
         Tab::Voice,
         Tab::Models,
         Tab::Pronunciation,
         Tab::Hotkeys,
+        Tab::Screenshot,
         Tab::Convert,
         Tab::About,
     ];
@@ -91,6 +93,7 @@ impl Tab {
             Tab::Models => "modelle",
             Tab::Pronunciation => "aussprache",
             Tab::Hotkeys => "tasten",
+            Tab::Screenshot => "screenshot",
             Tab::Convert => "konvertieren",
             Tab::About => "info",
         }
@@ -102,6 +105,7 @@ impl Tab {
             Tab::Models => "Modelle",
             Tab::Pronunciation => "Aussprache",
             Tab::Hotkeys => "Tastenkürzel",
+            Tab::Screenshot => "Screenshot",
             Tab::Convert => "Konvertieren",
             Tab::About => "Info & Updates",
         }
@@ -113,6 +117,7 @@ impl Tab {
             Tab::Models => (NavIcon::Download, Color32::from_rgb(0x8B, 0x5C, 0xF6)),
             Tab::Pronunciation => (NavIcon::Text, Color32::from_rgb(0x22, 0xA5, 0x5B)),
             Tab::Hotkeys => (NavIcon::Keyboard, Color32::from_rgb(0x6B, 0x72, 0x80)),
+            Tab::Screenshot => (NavIcon::Camera, Color32::from_rgb(0xD9, 0x46, 0x6F)),
             Tab::Convert => (NavIcon::Convert, ui_kit::ACCENT),
             Tab::About => (NavIcon::Info, Color32::from_rgb(0x0E, 0x9F, 0xB5)),
         }
@@ -123,6 +128,7 @@ impl Tab {
 enum HotkeyTarget {
     Speak,
     Ocr,
+    Snip,
 }
 
 enum DownloadState {
@@ -257,6 +263,7 @@ impl eframe::App for SettingsApp {
                     Tab::Models => self.models_tab(ui),
                     Tab::Pronunciation => self.pronunciation_tab(ui),
                     Tab::Hotkeys => self.hotkeys_tab(ui),
+                    Tab::Screenshot => self.screenshot_tab(ui),
                     Tab::Convert => self.convert_tab(ui),
                     Tab::About => self.about_tab(ui),
                 }
@@ -610,6 +617,7 @@ impl SettingsApp {
                         match target {
                             HotkeyTarget::Speak => self.settings.hotkey_speak = hotkey,
                             HotkeyTarget::Ocr => self.settings.hotkey_ocr = hotkey,
+                            HotkeyTarget::Snip => self.settings.hotkey_snip = hotkey,
                         }
                         self.message = None;
                         self.capture = None;
@@ -625,6 +633,7 @@ impl SettingsApp {
         let rows = [
             (HotkeyTarget::Speak, "Markierten Text vorlesen", "Nochmal drücken stoppt das Vorlesen.", self.settings.hotkey_speak.clone()),
             (HotkeyTarget::Ocr, "Text aus Bildausschnitt kopieren", "Bereich auswählen, der Text landet in der Zwischenablage.", self.settings.hotkey_ocr.clone()),
+            (HotkeyTarget::Snip, "Screenshot aufnehmen", "Bereich, Fenster oder Bildschirm wählen, danach bearbeiten.", self.settings.hotkey_snip.clone()),
         ];
         section(
             ui,
@@ -649,6 +658,111 @@ impl SettingsApp {
             self.capture = Some(target);
             self.message = None;
         }
+    }
+
+    fn screenshot_tab(&mut self, ui: &mut egui::Ui) {
+        page_header(
+            ui,
+            "Screenshot",
+            "Bildschirmausschnitte aufnehmen, beschriften, unkenntlich machen und teilen.",
+        );
+        let spawn = |args: &[&str]| {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe).args(args).spawn();
+            }
+        };
+
+        section(ui, Some("Nach der Aufnahme"), None, |g| {
+            g.row(
+                "Editor öffnen",
+                Some("Zum Beschriften, Zuschneiden und Unkenntlichmachen. Sonst erscheint nur ein Hinweis mit „Bearbeiten“."),
+                |ui| {
+                    toggle(ui, &mut self.settings.snip_open_editor);
+                },
+            );
+            g.row(
+                "In die Zwischenablage kopieren",
+                Some("Auch Änderungen im Editor landen automatisch dort – einfach mit Strg+V einfügen."),
+                |ui| {
+                    toggle(ui, &mut self.settings.snip_copy);
+                },
+            );
+            g.row("Automatisch speichern", Some("Jeden Screenshot als PNG im Ordner unten ablegen."), |ui| {
+                toggle(ui, &mut self.settings.snip_autosave);
+            });
+            let default_folder = crate::screenshot::default_folder();
+            g.custom(|ui| {
+                ui.label(RichText::new("Ordner für Screenshots").color(TEXT));
+                ui.label(
+                    RichText::new("Hier landen automatisch gespeicherte Screenshots; „Speichern unter“ im Editor schlägt ihn ebenfalls vor.")
+                        .font(regular(SMALL_SIZE))
+                        .color(TEXT_WEAK),
+                );
+                let custom = !self.settings.snip_folder.trim().is_empty();
+                let current = if custom {
+                    std::path::PathBuf::from(self.settings.snip_folder.trim())
+                } else {
+                    default_folder.clone()
+                };
+                ui.horizontal(|ui| {
+                    // Platz für die Knöpfe rechts lassen.
+                    let width = ui.available_width() - if custom { 260.0 } else { 175.0 };
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.snip_folder)
+                            .hint_text(format!("{} (Standard)", default_folder.display()))
+                            .desired_width(width.max(120.0)),
+                    );
+                    if ui.button("Durchsuchen …").clicked() {
+                        if let Some(folder) = crate::screenshot::pick_folder(&current) {
+                            // Wieder den Standard gewählt: leer lassen, dann folgt er z. B. einem neuen Benutzerprofil.
+                            self.settings.snip_folder =
+                                if folder == default_folder { String::new() } else { folder.display().to_string() };
+                        }
+                    }
+                    if ui.button("Öffnen").on_hover_text("Ordner im Explorer anzeigen").clicked() {
+                        let _ = std::fs::create_dir_all(&current);
+                        let _ = std::process::Command::new("explorer").arg(&current).spawn();
+                    }
+                    if custom && ui.button("Standard").on_hover_text("Zurück zu Bilder\\Screenshots").clicked() {
+                        self.settings.snip_folder.clear();
+                    }
+                });
+            });
+        });
+
+        section(ui, Some("Explorer"), None, |g| {
+            g.row(
+                "„Mit UtilityCrab bearbeiten“ im Kontextmenü",
+                Some("Rechtsklick auf ein Bild öffnet es im Editor. Unter Windows 11 unter „Weitere Optionen anzeigen“."),
+                |ui| {
+                    toggle(ui, &mut self.settings.edit_context_menu);
+                },
+            );
+        });
+
+        section(
+            ui,
+            None,
+            Some(
+                "Im Editor: Stift, Textmarker, Pfeile, Formen, Text, Schrittnummern, Verpixeln/Weichzeichnen/Schwärzen, \
+                 Spotlight, Zuschneiden, Text erkennen, sensible Daten automatisch unkenntlich machen und Anheften.",
+            ),
+            |g| {
+                g.row("Screenshot aufnehmen", Some("Auch über das Tastenkürzel oder das Tray-Menü."), |ui| {
+                    if ui.button("In 5 Sekunden").clicked() {
+                        spawn(&[crate::screenshot::CAPTURE_ARG, crate::screenshot::Prefs::load().mode.id(), "5"]);
+                    }
+                    if ui.button("Jetzt").clicked() {
+                        spawn(&[crate::screenshot::CAPTURE_ARG, crate::screenshot::Prefs::load().mode.id(), "0"]);
+                    }
+                });
+                g.row("Vorhandenes Bild bearbeiten", Some("Öffnet den Editor; Bilder lassen sich auch hineinziehen."), |ui| {
+                    if ui.button("Editor öffnen").clicked() {
+                        spawn(&[crate::screenshot::EDIT_ARG]);
+                    }
+                });
+            },
+        );
     }
 
     fn convert_tab(&mut self, ui: &mut egui::Ui) {
