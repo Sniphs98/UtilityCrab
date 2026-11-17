@@ -6,7 +6,7 @@
 use std::sync::OnceLock;
 
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
-use eframe::egui::{pos2, vec2, Color32, Pos2, Rect, Vec2};
+use crate::geom::{pos2, vec2, Color32, Pos2, Rect, Vec2};
 use image::RgbaImage;
 use tiny_skia::{
     BlendMode, FillRule, LineCap, LineJoin, Mask, Paint, Path, PathBuilder, Pixmap, PremultipliedColorU8, Stroke,
@@ -229,7 +229,9 @@ impl Canvas {
 
     /// Schreibt Text (mehrzeilig) mit der linken oberen Ecke bei `pos`.
     pub fn text(&mut self, pos: Pos2, text: &str, size: f32, color: Color32) {
-        let font = font();
+        let Some(font) = font() else {
+            return;
+        };
         let scaled = font.as_scaled(PxScale::from(size));
         let line_height = scaled.height() + scaled.line_gap();
         let (ox, oy) = self.origin;
@@ -325,33 +327,30 @@ fn paint(color: Color32, blend: BlendMode) -> Paint<'static> {
 // ---------------------------------------------------------------------------------------------
 // Schrift
 
-/// Segoe UI Semibold (lesbar auf Screenshots), sonst die eingebaute egui-Schrift.
-pub fn font() -> &'static FontArc {
-    static FONT: OnceLock<FontArc> = OnceLock::new();
+/// Segoe UI Semibold (lesbar auf Screenshots), sonst eine andere Windows-Schrift.
+/// `None` nur, wenn gar keine gefunden wird – dann bleibt Text unsichtbar statt abzustürzen.
+pub fn font() -> Option<&'static FontArc> {
+    static FONT: OnceLock<Option<FontArc>> = OnceLock::new();
     FONT.get_or_init(|| {
         let windir = std::env::var_os("WINDIR").unwrap_or_else(|| r"C:\Windows".into());
         let dir = std::path::PathBuf::from(windir).join("Fonts");
-        for file in ["seguisb.ttf", "segoeui.ttf", "arial.ttf"] {
-            if let Ok(bytes) = std::fs::read(dir.join(file)) {
-                if let Ok(font) = FontArc::try_from_vec(bytes) {
-                    return font;
-                }
-            }
-        }
-        let defaults = eframe::egui::FontDefinitions::default();
-        let data = defaults
-            .families
-            .get(&eframe::egui::FontFamily::Proportional)
-            .and_then(|names| names.first())
-            .and_then(|name| defaults.font_data.get(name))
-            .expect("egui bringt eine Schrift mit");
-        FontArc::try_from_vec((*data.font).as_ref().to_vec()).expect("egui-Schrift lesbar")
+        ["seguisb.ttf", "segoeui.ttf", "arial.ttf", "tahoma.ttf", "verdana.ttf"]
+            .iter()
+            .filter_map(|file| std::fs::read(dir.join(file)).ok())
+            .find_map(|bytes| FontArc::try_from_vec(bytes).ok())
     })
+    .as_ref()
 }
 
 /// Größe eines (mehrzeiligen) Textes in Pixeln.
 pub fn measure_text(text: &str, size: f32) -> Vec2 {
-    let scaled = font().as_scaled(PxScale::from(size));
+    let Some(font) = font() else {
+        // Grobe Schätzung, damit Rahmen und Trefferflächen trotzdem passen.
+        let lines = text.split('\n').count() as f32;
+        let longest = text.split('\n').map(|l| l.chars().count()).max().unwrap_or(0) as f32;
+        return vec2(longest * size * 0.55, lines * size * 1.2);
+    };
+    let scaled = font.as_scaled(PxScale::from(size));
     let line_height = scaled.height() + scaled.line_gap();
     let mut width: f32 = 0.0;
     let mut lines = 0;

@@ -7,41 +7,36 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use eframe::egui::{self, Color32, RichText};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::progress::Progress;
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
 use rayon::prelude::*;
 
 use super::batch::Queue;
 use super::{convert_file, copy_to_clipboard, describe, human_size, Format, Options, Outcome, Resize, INPUT_EXTENSIONS};
-use crate::settings_ui::{accent_button, apply_theme, window_icon, ACCENT, CARD_BG, PAGE_BG};
+use crate::ui_kit::{
+    self, button, h_flex, page_header, primary_button, section, strong, text, v_flex, Disableable, Sizable, ACCENT,
+    BODY_SIZE, CONTENT_BG, GREEN, RED, SMALL_SIZE, TEXT, TEXT_WEAK,
+};
 
-const GREEN: Color32 = Color32::from_rgb(0x3C, 0xA0, 0x50);
-const RED: Color32 = Color32::from_rgb(0xD0, 0x40, 0x30);
-
+/// Öffnet das Fenster und blockiert, bis es geschlossen ist.
 pub fn run(files: Vec<PathBuf>, queue: Option<Queue>) {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("UtilityCrab – Bilder konvertieren")
-            .with_inner_size([700.0, 640.0])
-            .with_min_inner_size([560.0, 480.0])
-            .with_drag_and_drop(true)
-            .with_icon(window_icon()),
-        ..Default::default()
-    };
-    let result = eframe::run_native(
-        "UtilityCrab-Konverter",
-        options,
-        Box::new(move |cc| {
-            apply_theme(&cc.egui_ctx);
-            let mut app = ConverterApp::new(queue);
-            app.add_files(files);
-            Ok(Box::new(app))
-        }),
-    );
-    if let Err(e) = result {
-        crate::report(Err(format!("Konverter-Fenster: {e}")));
-    }
+    ui_kit::run_app(move |cx| {
+        let options = ui_kit::window_options("UtilityCrab – Bilder konvertieren", (700.0, 640.0), (560.0, 480.0), cx);
+        ui_kit::open_window(options, cx, move |window, cx| {
+            cx.new(|cx| {
+                let mut app = ConverterApp::new(queue, window, cx);
+                app.add_files(files);
+                app
+            })
+        });
+    });
 }
 
 #[derive(Clone)]
@@ -65,8 +60,8 @@ struct ConverterApp {
     options: Options,
     saved: Options,
     queue: Option<Queue>,
-    last_poll: Instant,
     running: Arc<Mutex<bool>>,
+    was_running: bool,
     /// Zuletzt eingestellte Werte, damit sie beim Umschalten der Größenart erhalten bleiben.
     long_edge: u32,
     percent: u32,
@@ -74,14 +69,29 @@ struct ConverterApp {
     message: Option<String>,
     /// Hinweis nach dem Durchlauf, z. B. dass die Dateien in der Zwischenablage liegen.
     notice: Arc<Mutex<Option<String>>>,
+    quality: Entity<SliderState>,
+    long_edge_input: Entity<InputState>,
+    percent_input: Entity<InputState>,
+    max_kb_input: Entity<InputState>,
+    _subscriptions: Vec<Subscription>,
+    _poll: Task<()>,
 }
 
 fn options_path() -> PathBuf {
     crate::data_dir().join("konverter.json")
 }
 
+/// Zahlenfeld: nur Ziffern, Wert wird beim Tippen übernommen und beim Verlassen begrenzt.
+fn number_input(value: u32, window: &mut Window, cx: &mut Context<ConverterApp>) -> Entity<InputState> {
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .default_value(value.to_string())
+            .validate(|text, _| text.chars().all(|c| c.is_ascii_digit()) && text.len() <= 6)
+    })
+}
+
 impl ConverterApp {
-    fn new(queue: Option<Queue>) -> Self {
+    fn new(queue: Option<Queue>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let options: Options = fs::read_to_string(options_path())
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
@@ -94,23 +104,168 @@ impl ConverterApp {
             Resize::Percent(v) => v,
             _ => 50,
         };
+        let max_kb = options.max_kb.unwrap_or(500);
+
+        let quality = cx.new(|_| {
+            SliderState::new()
+                .min(1.0)
+                .max(100.0)
+                .step(1.0)
+                .default_value(options.quality as f32)
+        });
+        let long_edge_input = number_input(long_edge, window, cx);
+        let percent_input = number_input(percent, window, cx);
+        let max_kb_input = number_input(max_kb, window, cx);
+
+        let mut subscriptions = vec![cx.subscribe_in(&quality, window, |this, _, event: &SliderEvent, _, cx| {
+            if let SliderEvent::Change(value) = event {
+                this.options.quality = value.end().round().clamp(1.0, 100.0) as u8;
+                this.changed(cx);
+            }
+        })];
+        for (input, field) in [
+            (&long_edge_input, NumberField::LongEdge),
+            (&percent_input, NumberField::Percent),
+            (&max_kb_input, NumberField::MaxKb),
+        ] {
+            subscriptions.push(cx.subscribe_in(input, window, move |this, state, event: &InputEvent, window, cx| {
+                let parsed: Option<u32> = state.read(cx).value().parse().ok();
+                match event {
+                    InputEvent::Change => {
+                        if let Some(v) = parsed {
+                            this.set_number(field, v, false);
+                            this.changed(cx);
+                        }
+                    }
+                    InputEvent::Blur | InputEvent::PressEnter { .. } => {
+                        let v = this.set_number(field, parsed.unwrap_or(0), true);
+                        state.update(cx, |s, cx| s.set_value(v.to_string(), window, cx));
+                        this.changed(cx);
+                    }
+                    _ => {}
+                }
+            }));
+        }
+
+        // Dateien, die nachträglich per Kontextmenü dazukommen, und Fortschritt der Arbeit.
+        let poll = cx.spawn_in(window, async move |this, cx| {
+            let mut ticks = 0u32;
+            loop {
+                cx.background_executor().timer(Duration::from_millis(100)).await;
+                ticks += 1;
+                let alive = this.update_in(cx, |this, window, cx| {
+                    if ticks % 5 == 0 {
+                        if let Some(queue) = &this.queue {
+                            let files = queue.drain();
+                            if !files.is_empty() {
+                                this.add_files(files);
+                                window.activate_window();
+                                cx.notify();
+                            }
+                        }
+                    }
+                    // Solange es läuft und einmal danach (Ergebnis, Hinweis) neu zeichnen.
+                    let running = this.is_running();
+                    if running || this.was_running {
+                        cx.notify();
+                    }
+                    this.was_running = running;
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        });
+
         Self {
             items: Vec::new(),
             saved: options.clone(),
-            max_kb: options.max_kb.unwrap_or(500),
+            max_kb,
             options,
             queue,
-            last_poll: Instant::now(),
             running: Arc::new(Mutex::new(false)),
+            was_running: false,
             long_edge,
             percent,
             message: None,
             notice: Arc::default(),
+            quality,
+            long_edge_input,
+            percent_input,
+            max_kb_input,
+            _subscriptions: subscriptions,
+            _poll: poll,
         }
     }
 
     fn is_running(&self) -> bool {
         *self.running.lock().unwrap()
+    }
+
+    /// Setzt ein Zahlenfeld; `clamp` begrenzt auf den erlaubten Bereich. Gibt den Wert zurück.
+    fn set_number(&mut self, field: NumberField, value: u32, clamp: bool) -> u32 {
+        let (min, max) = field.range();
+        let value = if clamp { value.clamp(min, max) } else { value };
+        if !clamp && !(min..=max).contains(&value) {
+            return value;
+        }
+        match field {
+            NumberField::LongEdge => {
+                self.long_edge = value;
+                if matches!(self.options.resize, Resize::LongEdge(_)) {
+                    self.options.resize = Resize::LongEdge(value);
+                }
+            }
+            NumberField::Percent => {
+                self.percent = value;
+                if matches!(self.options.resize, Resize::Percent(_)) {
+                    self.options.resize = Resize::Percent(value);
+                }
+            }
+            NumberField::MaxKb => {
+                self.max_kb = value;
+                if self.options.max_kb.is_some() {
+                    self.options.max_kb = Some(value);
+                }
+            }
+        }
+        value
+    }
+
+    /// Einstellungen speichern und neu zeichnen.
+    fn changed(&mut self, cx: &mut Context<Self>) {
+        if self.options != self.saved {
+            if let Ok(json) = serde_json::to_string_pretty(&self.options) {
+                let _ = fs::create_dir_all(crate::data_dir());
+                let _ = fs::write(options_path(), json);
+            }
+            self.saved = self.options.clone();
+        }
+        cx.notify();
+    }
+
+    /// Nach einer Vorlage die Bedienelemente auf die neuen Werte setzen.
+    fn apply_preset(&mut self, options: Options, window: &mut Window, cx: &mut Context<Self>) {
+        if let Resize::LongEdge(v) = options.resize {
+            self.long_edge = v;
+        }
+        if let Resize::Percent(v) = options.resize {
+            self.percent = v;
+        }
+        if let Some(v) = options.max_kb {
+            self.max_kb = v;
+        }
+        self.options = options;
+        let quality = self.options.quality as f32;
+        self.quality.update(cx, |s, cx| s.set_value(quality, window, cx));
+        for (input, value) in [
+            (self.long_edge_input.clone(), self.long_edge),
+            (self.percent_input.clone(), self.percent),
+            (self.max_kb_input.clone(), self.max_kb),
+        ] {
+            input.update(cx, |s, cx| s.set_value(value.to_string(), window, cx));
+        }
+        self.changed(cx);
     }
 
     fn add_files(&mut self, files: Vec<PathBuf>) {
@@ -141,7 +296,7 @@ impl ConverterApp {
         }
     }
 
-    fn start(&mut self, ctx: egui::Context) {
+    fn start(&mut self, cx: &mut Context<Self>) {
         let jobs: Vec<(PathBuf, Arc<Mutex<Status>>, Arc<AtomicU32>)> = self
             .items
             .iter()
@@ -157,14 +312,12 @@ impl ConverterApp {
         *running.lock().unwrap() = true;
         *notice.lock().unwrap() = None;
         self.message = None;
+        cx.notify();
+        // Das Fenster fragt Fortschritt und Status alle 100 ms ab, solange es läuft.
         thread::spawn(move || {
             jobs.par_iter().for_each(|(path, status, progress)| {
                 *status.lock().unwrap() = Status::Working;
-                ctx.request_repaint();
-                let on_progress = |p: f32| {
-                    progress.store((p * 1000.0) as u32, Ordering::Relaxed);
-                    ctx.request_repaint();
-                };
+                let on_progress = |p: f32| progress.store((p * 1000.0) as u32, Ordering::Relaxed);
                 let result = match convert_file(path, &options, &on_progress) {
                     Ok(outcome) => Status::Done(outcome),
                     Err(e) => {
@@ -174,7 +327,6 @@ impl ConverterApp {
                 };
                 *status.lock().unwrap() = result;
                 progress.store(1000, Ordering::Relaxed);
-                ctx.request_repaint();
             });
 
             let written: Vec<PathBuf> = jobs
@@ -192,7 +344,6 @@ impl ConverterApp {
                 });
             }
             *running.lock().unwrap() = false;
-            ctx.request_repaint();
         });
     }
 
@@ -207,284 +358,351 @@ impl ConverterApp {
     }
 }
 
-impl eframe::App for ConverterApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
+#[derive(Clone, Copy)]
+enum NumberField {
+    LongEdge,
+    Percent,
+    MaxKb,
+}
 
-        // Dateien, die nachträglich per Kontextmenü dazukommen.
-        if self.last_poll.elapsed() > Duration::from_millis(500) {
-            self.last_poll = Instant::now();
-            if let Some(queue) = &self.queue {
-                let files = queue.drain();
-                if !files.is_empty() {
-                    self.add_files(files);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+impl NumberField {
+    fn range(self) -> (u32, u32) {
+        match self {
+            NumberField::LongEdge => (16, 20000),
+            NumberField::Percent => (1, 400),
+            NumberField::MaxKb => (10, 100_000),
+        }
+    }
+}
+
+impl Render for ConverterApp {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let running = self.is_running();
+        div()
+            .id("konverter")
+            .size_full()
+            .bg(CONTENT_BG)
+            .font_family(ui_kit::FONT)
+            .text_size(px(BODY_SIZE))
+            .text_color(TEXT)
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                if !this.is_running() {
+                    this.add_files(paths.paths().to_vec());
+                    cx.notify();
                 }
-            }
-        }
-        // Per Drag & Drop hineingezogene Dateien.
-        let dropped: Vec<PathBuf> = ui.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
-        if !dropped.is_empty() && !self.is_running() {
-            self.add_files(dropped);
-        }
-        let hovering = ui.input(|i| !i.raw.hovered_files.is_empty());
-
-        let page = egui::Frame::new().fill(PAGE_BG).inner_margin(egui::Margin::symmetric(24, 16));
-        egui::CentralPanel::default().frame(page).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Bilder konvertieren & verkleinern");
-                ui.label(RichText::new("Die Originale bleiben unverändert, neue Dateien landen daneben.").weak());
-                ui.add_space(10.0);
-                self.file_list(ui, hovering);
-                ui.add_space(12.0);
-                self.settings(ui);
-                ui.add_space(14.0);
-                self.actions(ui, &ctx);
-                if let Some(message) = &self.message {
-                    ui.add_space(8.0);
-                    ui.colored_label(RED, message);
-                }
-            });
-        });
-
-        if self.options != self.saved {
-            if let Ok(json) = serde_json::to_string_pretty(&self.options) {
-                let _ = fs::create_dir_all(crate::data_dir());
-                let _ = fs::write(options_path(), json);
-            }
-            self.saved = self.options.clone();
-        }
-
-        // Warteschlange regelmäßig ansehen, auch ohne Mausbewegung.
-        ctx.request_repaint_after(Duration::from_millis(500));
+            }))
+            .child(
+                v_flex()
+                    .id("seite")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .px(px(24.0))
+                    .py(px(16.0))
+                    .child(page_header(
+                        "Bilder konvertieren & verkleinern",
+                        "Die Originale bleiben unverändert, neue Dateien landen daneben.",
+                    ))
+                    .child(self.file_list(running, cx))
+                    .child(self.settings(running, cx))
+                    .child(self.actions(running, cx))
+                    .when_some(self.message.clone(), |el, message| el.child(text(message, BODY_SIZE, RED).mt(px(8.0)))),
+            )
     }
 }
 
 impl ConverterApp {
-    fn file_list(&mut self, ui: &mut egui::Ui, hovering: bool) {
-        let running = self.is_running();
-        let stroke = if hovering {
-            egui::Stroke::new(2.0, ACCENT)
-        } else {
-            egui::Stroke::NONE
-        };
-        let mut remove = None;
-        egui::Frame::new()
-            .fill(CARD_BG)
-            .stroke(stroke)
-            .inner_margin(egui::Margin::same(14))
-            .corner_radius(10.0)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                if self.items.is_empty() {
-                    ui.add_space(24.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("Bilder oder Ordner hierher ziehen").size(17.0));
-                        ui.label(
-                            RichText::new("PNG, JPG, WebP, BMP, GIF, TIFF, ICO, HEIC, AVIF")
-                                .small()
-                                .weak(),
-                        );
-                    });
-                    ui.add_space(24.0);
-                    return;
-                }
-                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                    egui::Grid::new("files")
-                        .num_columns(3)
-                        .spacing([12.0, 6.0])
-                        .striped(true)
-                        .show(ui, |ui| {
-                            for (index, item) in self.items.iter().enumerate() {
-                                ui.label(file_name(&item.path)).on_hover_text(item.path.display().to_string());
-                                match &*item.status.lock().unwrap() {
-                                    Status::Ready => ui.label(RichText::new(human_size(item.size)).weak()),
-                                    Status::Working => ui.add(
-                                        egui::ProgressBar::new(item.progress.load(Ordering::Relaxed) as f32 / 1000.0)
-                                            .desired_width(160.0)
-                                            .show_percentage(),
-                                    ),
-                                    Status::Done(outcome @ Outcome::Written { .. }) => {
-                                        ui.label(RichText::new(describe(outcome)).color(GREEN))
-                                    }
-                                    Status::Done(outcome) => ui.label(RichText::new(describe(outcome)).weak()),
-                                    Status::Failed(e) => {
-                                        let short = e.split_once(": ").map(|(_, m)| m).unwrap_or(e);
-                                        ui.label(RichText::new(short).color(RED))
-                                    }
-                                };
-                                if ui.add_enabled(!running, egui::Button::new("Entfernen").small()).clicked() {
-                                    remove = Some(index);
-                                }
-                                ui.end_row();
-                            }
-                        });
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{} Dateien – weitere hierher ziehen", self.items.len())).weak());
-                    if ui.add_enabled(!running, egui::Button::new("Liste leeren").small()).clicked() {
-                        self.items.clear();
-                    }
-                });
-            });
-        if let Some(index) = remove {
-            self.items.remove(index);
+    fn file_list(&self, running: bool, cx: &mut Context<Self>) -> AnyElement {
+        let frame = v_flex()
+            .id("dateien")
+            .w_full()
+            .mb(px(18.0))
+            .p(px(14.0))
+            .rounded(px(10.0))
+            .bg(ui_kit::GROUP_BG)
+            .border_2()
+            .border_color(gpui_kit::transparent_black())
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.border_color(ACCENT));
+
+        if self.items.is_empty() {
+            return frame
+                .py(px(36.0))
+                .items_center()
+                .gap(px(4.0))
+                .child(text("Bilder oder Ordner hierher ziehen", 17.0, TEXT))
+                .child(text("PNG, JPG, WebP, BMP, GIF, TIFF, ICO, HEIC, AVIF", SMALL_SIZE, TEXT_WEAK))
+                .into_any_element();
         }
+
+        let rows = self.items.iter().enumerate().map(|(index, item)| {
+            let status: AnyElement = match &*item.status.lock().unwrap() {
+                Status::Ready => text(human_size(item.size), BODY_SIZE, TEXT_WEAK).into_any_element(),
+                Status::Working => {
+                    let value = item.progress.load(Ordering::Relaxed) as f32 / 10.0;
+                    h_flex()
+                        .gap(px(8.0))
+                        .child(div().w(px(160.0)).child(Progress::new(("fortschritt", index)).value(value)))
+                        .child(text(format!("{value:.0} %"), SMALL_SIZE, TEXT_WEAK))
+                        .into_any_element()
+                }
+                Status::Done(outcome @ Outcome::Written { .. }) => text(describe(outcome), BODY_SIZE, GREEN).into_any_element(),
+                Status::Done(outcome) => text(describe(outcome), BODY_SIZE, TEXT_WEAK).into_any_element(),
+                Status::Failed(e) => {
+                    let short = e.split_once(": ").map(|(_, m)| m).unwrap_or(e).to_string();
+                    text(short, BODY_SIZE, RED).into_any_element()
+                }
+            };
+            let full_path = item.path.display().to_string();
+            h_flex()
+                .id(("datei", index))
+                .w_full()
+                .min_h(px(30.0))
+                .px(px(6.0))
+                .gap(px(12.0))
+                .rounded(px(6.0))
+                .when(index % 2 == 1, |el| el.bg(ui_kit::tint(TEXT, 0.03)))
+                .child(
+                    div()
+                        .id(("name", index))
+                        .w(px(220.0))
+                        .flex_none()
+                        .truncate()
+                        .child(file_name(&item.path))
+                        .tooltip(move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(full_path.clone()).build(window, cx)
+                        }),
+                )
+                .child(div().flex_1().min_w_0().child(status))
+                .child(
+                    button(("entfernen", index), "Entfernen")
+                        .small()
+                        .disabled(running)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            if index < this.items.len() {
+                                this.items.remove(index);
+                            }
+                            cx.notify();
+                        })),
+                )
+        });
+
+        frame
+            .child(v_flex().id("liste").max_h(px(220.0)).overflow_y_scroll().children(rows))
+            .child(
+                h_flex()
+                    .mt(px(8.0))
+                    .gap(px(10.0))
+                    .child(text(
+                        format!("{} Dateien – weitere hierher ziehen", self.items.len()),
+                        SMALL_SIZE,
+                        TEXT_WEAK,
+                    ))
+                    .child(
+                        button("leeren", "Liste leeren")
+                            .small()
+                            .disabled(running)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.items.clear();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
-    fn settings(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Vorlagen:").weak());
-            if ui.button("Für E-Mail").on_hover_text("JPG, max. 1600 px, Qualität 75").clicked() {
-                self.options = Options {
-                    format: Some(Format::Jpg),
-                    quality: 75,
-                    resize: Resize::LongEdge(1600),
-                    max_kb: None,
-                };
-                self.long_edge = 1600;
-            }
-            if ui.button("Für Webseiten").on_hover_text("WebP, max. 1920 px, Qualität 80").clicked() {
-                self.options = Options {
-                    format: Some(Format::Webp),
-                    quality: 80,
-                    resize: Resize::LongEdge(1920),
-                    max_kb: None,
-                };
-                self.long_edge = 1920;
-            }
-            if ui.button("Unter 1 MB").on_hover_text("JPG, höchstens 1 MB pro Bild").clicked() {
-                self.options = Options {
-                    format: Some(Format::Jpg),
-                    quality: 90,
-                    resize: Resize::None,
-                    max_kb: Some(1000),
-                };
-                self.max_kb = 1000;
-            }
-            if ui.button("Nur verkleinern").on_hover_text("Format behalten, sparsamer speichern").clicked() {
-                self.options = Options::shrink();
-            }
-        });
-        ui.add_space(8.0);
-
+    fn settings(&self, running: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let format = self.options.format;
         // Mit „Wie Original“ kann das Ziel JPG/WebP sein, Qualität also einstellbar lassen.
         let lossy = format.is_none_or(Format::lossy);
 
-        egui::Grid::new("options")
-            .num_columns(2)
-            .spacing([16.0, 12.0])
-            .show(ui, |ui| {
-                ui.label("Zielformat");
-                let current = format.map(Format::label).unwrap_or("Wie Original");
-                egui::ComboBox::from_id_salt("format")
-                    .selected_text(current)
-                    .width(220.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.options.format, None, "Wie Original")
-                            .on_hover_text("BMP/TIFF werden zu PNG, HEIC/AVIF zu JPG");
-                        for f in Format::ALL {
-                            ui.selectable_value(&mut self.options.format, Some(f), f.label());
-                        }
-                    });
-                ui.end_row();
+        let preset = |id: &'static str, label: &'static str, hint: &'static str, options: fn() -> Options| {
+            button(id, label)
+                .small()
+                .tooltip(hint)
+                .disabled(running)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.apply_preset(options(), window, cx)))
+        };
+        let presets = h_flex()
+            .flex_wrap()
+            .gap(px(6.0))
+            .child(preset("email", "Für E-Mail", "JPG, max. 1600 px, Qualität 75", || Options {
+                format: Some(Format::Jpg),
+                quality: 75,
+                resize: Resize::LongEdge(1600),
+                max_kb: None,
+            }))
+            .child(preset("web", "Für Webseiten", "WebP, max. 1920 px, Qualität 80", || Options {
+                format: Some(Format::Webp),
+                quality: 80,
+                resize: Resize::LongEdge(1920),
+                max_kb: None,
+            }))
+            .child(preset("1mb", "Unter 1 MB", "JPG, höchstens 1 MB pro Bild", || Options {
+                format: Some(Format::Jpg),
+                quality: 90,
+                resize: Resize::None,
+                max_kb: Some(1000),
+            }))
+            .child(preset("verkleinern", "Nur verkleinern", "Format behalten, sparsamer speichern", Options::shrink));
 
-                ui.label("Qualität");
-                ui.add_enabled_ui(lossy, |ui| {
-                    ui.add(egui::Slider::new(&mut self.options.quality, 1..=100))
-                        .on_hover_text("Nur für JPG und WebP. 75–85 ist meist kaum vom Original zu unterscheiden. WebP mit 100 = verlustfrei.");
-                });
-                ui.end_row();
-
-                ui.label("Bildgröße");
-                ui.horizontal(|ui| {
-                    let mut kind = match self.options.resize {
-                        Resize::None => 0,
-                        Resize::LongEdge(_) => 1,
-                        Resize::Percent(_) => 2,
-                    };
-                    let labels = ["Nicht ändern", "Längste Seite höchstens", "Prozent"];
-                    egui::ComboBox::from_id_salt("resize")
-                        .selected_text(labels[kind])
-                        .width(220.0)
-                        .show_ui(ui, |ui| {
-                            for (i, label) in labels.iter().enumerate() {
-                                ui.selectable_value(&mut kind, i, *label);
-                            }
-                        });
-                    match kind {
-                        1 => {
-                            ui.add(egui::DragValue::new(&mut self.long_edge).range(16..=20000).suffix(" px"));
-                            self.options.resize = Resize::LongEdge(self.long_edge);
-                        }
-                        2 => {
-                            ui.add(egui::DragValue::new(&mut self.percent).range(1..=400).suffix(" %"));
-                            self.options.resize = Resize::Percent(self.percent);
-                        }
-                        _ => self.options.resize = Resize::None,
+        let format_menu = button("format", format.map(Format::label).unwrap_or("Wie Original"))
+            .dropdown_caret(true)
+            .disabled(running)
+            .dropdown_menu({
+                let view = cx.entity().downgrade();
+                move |mut menu, _, _| {
+                    let choices = std::iter::once((None, "Wie Original")).chain(Format::ALL.iter().map(|f| (Some(*f), f.label())));
+                    for (value, label) in choices {
+                        let view = view.clone();
+                        menu = menu.item(PopupMenuItem::new(label).checked(value == format).on_click(move |_, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.options.format = value;
+                                this.changed(cx);
+                            });
+                        }));
                     }
-                });
-                ui.end_row();
-
-                ui.label("Dateigröße");
-                ui.add_enabled_ui(lossy, |ui| {
-                    ui.horizontal(|ui| {
-                        let mut limit = self.options.max_kb.is_some();
-                        ui.checkbox(&mut limit, "Höchstens");
-                        ui.add_enabled(limit, egui::DragValue::new(&mut self.max_kb).range(10..=100_000).suffix(" KB"));
-                        self.options.max_kb = limit.then_some(self.max_kb);
-                    })
-                    .response
-                    .on_hover_text("Senkt Qualität und notfalls Auflösung, bis die Datei klein genug ist. Nur JPG und WebP.");
-                });
-                ui.end_row();
+                    menu
+                }
             });
 
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new("Metadaten wie Kamera und GPS-Position werden dabei entfernt.").weak(),
-        );
+        let resize_kind = match self.options.resize {
+            Resize::None => 0,
+            Resize::LongEdge(_) => 1,
+            Resize::Percent(_) => 2,
+        };
+        const RESIZE_LABELS: [&str; 3] = ["Nicht ändern", "Längste Seite höchstens", "Prozent"];
+        let resize_menu = button("groesse", RESIZE_LABELS[resize_kind])
+            .dropdown_caret(true)
+            .disabled(running)
+            .dropdown_menu({
+                let view = cx.entity().downgrade();
+                move |mut menu, _, _| {
+                    for (i, label) in RESIZE_LABELS.iter().enumerate() {
+                        let view = view.clone();
+                        menu = menu.item(PopupMenuItem::new(*label).checked(i == resize_kind).on_click(move |_, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.options.resize = match i {
+                                    1 => Resize::LongEdge(this.long_edge),
+                                    2 => Resize::Percent(this.percent),
+                                    _ => Resize::None,
+                                };
+                                this.changed(cx);
+                            });
+                        }));
+                    }
+                    menu
+                }
+            });
+        let resize_value = match resize_kind {
+            1 => Some((self.long_edge_input.clone(), "px")),
+            2 => Some((self.percent_input.clone(), "%")),
+            _ => None,
+        };
+
+        let limit = self.options.max_kb.is_some();
+
+        v_flex()
+            .w_full()
+            .child(h_flex().gap(px(8.0)).mb(px(10.0)).child(text("Vorlagen:", BODY_SIZE, TEXT_WEAK)).child(presets))
+            .child(
+                section()
+                    .row(
+                        "Zielformat",
+                        Some("„Wie Original“: BMP/TIFF werden zu PNG, HEIC/AVIF zu JPG"),
+                        format_menu,
+                    )
+                    .row(
+                        "Qualität",
+                        Some("Nur für JPG und WebP. 75–85 ist meist kaum vom Original zu unterscheiden. WebP mit 100 = verlustfrei."),
+                        h_flex()
+                            .gap(px(10.0))
+                            .child(div().w(px(180.0)).child(Slider::new(&self.quality).disabled(!lossy || running)))
+                            .child(strong(self.options.quality.to_string(), BODY_SIZE, TEXT).w(px(28.0))),
+                    )
+                    .row(
+                        "Bildgröße",
+                        None,
+                        h_flex().gap(px(8.0)).child(resize_menu).when_some(resize_value, |el, (input, unit)| {
+                            el.child(div().w(px(90.0)).child(Input::new(&input).small().disabled(running)))
+                                .child(text(unit, BODY_SIZE, TEXT_WEAK))
+                        }),
+                    )
+                    .row(
+                        "Dateigröße begrenzen",
+                        Some("Senkt Qualität und notfalls Auflösung, bis die Datei klein genug ist. Nur JPG und WebP."),
+                        h_flex()
+                            .gap(px(8.0))
+                            .when(limit, |el| {
+                                el.child(
+                                    div()
+                                        .w(px(90.0))
+                                        .child(Input::new(&self.max_kb_input).small().disabled(running || !lossy)),
+                                )
+                                .child(text("KB", BODY_SIZE, TEXT_WEAK))
+                            })
+                            .child(
+                                Switch::new("limit")
+                                    .checked(limit)
+                                    .disabled(running || !lossy)
+                                    .on_click(cx.listener(|this, on: &bool, _, cx| {
+                                        this.options.max_kb = on.then_some(this.max_kb);
+                                        this.changed(cx);
+                                    })),
+                            ),
+                    )
+                    .footnote("Metadaten wie Kamera und GPS-Position werden dabei entfernt."),
+            )
     }
 
-    fn actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let running = self.is_running();
-        if running {
+    fn actions(&self, running: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let written = self.written_files();
+        let progress = running.then(|| {
             let total: u32 = self.items.iter().map(|i| i.progress.load(Ordering::Relaxed)).sum();
-            let fraction = total as f32 / (1000 * self.items.len().max(1)) as f32;
-            ui.add(egui::ProgressBar::new(fraction).show_percentage().fill(ACCENT));
-            ui.add_space(6.0);
-        }
-        ui.horizontal(|ui| {
-            let label = if running { "Läuft …" } else { "Konvertieren" };
-            let enabled = !running && !self.items.is_empty();
-            if ui.add_enabled(enabled, accent_button(label).min_size(egui::vec2(160.0, 34.0))).clicked() {
-                self.start(ctx.clone());
-            }
-            let written = self.written_files();
-            if !running && !written.is_empty() {
-                if ui.button("Im Explorer zeigen").clicked() {
-                    // raw_arg, weil Explorer das Anführungszeichen erst nach dem Komma erwartet.
-                    let _ = std::process::Command::new("explorer")
-                        .raw_arg(format!("/select,\"{}\"", written[0].display()))
-                        .spawn();
-                }
-                let (before, after) = self.items.iter().fold((0u64, 0u64), |(b, a), item| {
-                    match &*item.status.lock().unwrap() {
-                        Status::Done(Outcome::Written { before, after, .. }) => (b + before, a + after),
-                        _ => (b, a),
-                    }
-                });
-                ui.label(RichText::new(format!("Gesamt: von {} auf {}", human_size(before), human_size(after))).weak());
-            }
+            total as f32 / (10 * self.items.len().max(1)) as f32
         });
-        if !running {
-            if let Some(notice) = &*self.notice.lock().unwrap() {
-                ui.add_space(6.0);
-                ui.label(RichText::new(notice).color(GREEN));
-            }
-        }
+        let summary = (!running && !written.is_empty()).then(|| {
+            self.items.iter().fold((0u64, 0u64), |(b, a), item| match &*item.status.lock().unwrap() {
+                Status::Done(Outcome::Written { before, after, .. }) => (b + before, a + after),
+                _ => (b, a),
+            })
+        });
+        let notice = if running { None } else { self.notice.lock().unwrap().clone() };
+
+        v_flex()
+            .w_full()
+            .gap(px(8.0))
+            .when_some(progress, |el, value| {
+                el.child(
+                    h_flex()
+                        .gap(px(10.0))
+                        .child(div().flex_1().child(Progress::new("gesamt").value(value)))
+                        .child(text(format!("{value:.0} %"), SMALL_SIZE, TEXT_WEAK)),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap(px(10.0))
+                    .child(
+                        primary_button("start", if running { "Läuft …" } else { "Konvertieren" })
+                            .min_w(px(160.0))
+                            .disabled(running || self.items.is_empty())
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.start(cx))),
+                    )
+                    .when_some(summary, |el, (before, after)| {
+                        let first = written[0].clone();
+                        el.child(button("explorer", "Im Explorer zeigen").on_click(move |_, _, _| {
+                            // raw_arg, weil Explorer das Anführungszeichen erst nach dem Komma erwartet.
+                            let _ = std::process::Command::new("explorer")
+                                .raw_arg(format!("/select,\"{}\"", first.display()))
+                                .spawn();
+                        }))
+                        .child(text(
+                            format!("Gesamt: von {} auf {}", human_size(before), human_size(after)),
+                            BODY_SIZE,
+                            TEXT_WEAK,
+                        ))
+                    }),
+            )
+            .when_some(notice, |el, notice| el.child(text(notice, BODY_SIZE, GREEN)))
     }
 }
 

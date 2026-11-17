@@ -1,7 +1,11 @@
 //! Kleine Strichsymbole für Werkzeugleiste und Aufnahme-Leiste, mit dem Painter gezeichnet
 //! (keine Bilddateien, gestochen scharf bei jeder Skalierung). Entworfen auf 20×20 Punkten.
 
-use eframe::egui::{pos2, vec2, Color32, CornerRadius, Painter, Pos2, Rect, Shape, Stroke, StrokeKind};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::*;
+
+use crate::geom::{pos2, vec2, Color32, Pos2, Rect};
+use crate::ui_kit::{painted, tint, Painter, ACCENT, TEXT, TEXT_FAINT};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Glyph {
@@ -37,58 +41,63 @@ pub enum Glyph {
     Close,
 }
 
-pub fn paint(glyph: Glyph, painter: &Painter, rect: Rect, color: Color32) {
+pub fn paint(glyph: Glyph, painter: &mut Painter, rect: Rect, color: Color32) {
     let s = rect.width().min(rect.height()) / 20.0;
     let c = rect.center();
     let p = |x: f32, y: f32| c + vec2(x, y) * s;
-    let stroke = Stroke::new(1.5 * s, color);
-    let line = |points: &[Pos2]| painter.add(Shape::line(points.to_vec(), stroke));
+    let width = 1.5 * s;
     let rect_at = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(p(x, y), vec2(w, h) * s);
+    macro_rules! stroke {
+        ($points:expr) => {
+            painter.line($points, width, color)
+        };
+    }
 
     match glyph {
         Glyph::Select => {
-            let points = vec![p(-4.0, -7.0), p(-4.0, 6.0), p(-0.8, 3.0), p(1.6, 8.0), p(3.6, 7.0), p(1.2, 2.2), p(5.5, 2.0)];
-            painter.add(Shape::closed_line(points, stroke));
+            let points = [p(-4.0, -7.0), p(-4.0, 6.0), p(-0.8, 3.0), p(1.6, 8.0), p(3.6, 7.0), p(1.2, 2.2), p(5.5, 2.0)];
+            painter.closed_line(&points, width, color);
         }
         Glyph::Pen => {
-            line(&[p(-6.0, 6.0), p(-5.0, 2.5), p(4.0, -6.5), p(6.5, -4.0), p(-2.5, 5.0), p(-6.0, 6.0)]);
-            line(&[p(2.0, -4.5), p(4.5, -2.0)]);
+            stroke!(&[p(-6.0, 6.0), p(-5.0, 2.5), p(4.0, -6.5), p(6.5, -4.0), p(-2.5, 5.0), p(-6.0, 6.0)]);
+            stroke!(&[p(2.0, -4.5), p(4.5, -2.0)]);
         }
         Glyph::Highlighter => {
-            line(&[p(-3.0, 4.0), p(-5.0, 2.0), p(3.0, -6.0), p(5.0, -4.0), p(-3.0, 4.0)]);
-            line(&[p(-5.0, 2.0), p(-6.5, 5.5), p(-3.0, 4.0)]);
-            painter.line_segment([p(-7.0, 7.5), p(7.0, 7.5)], Stroke::new(2.5 * s, Color32::from_rgb(0xFF, 0xD8, 0x3D)));
+            stroke!(&[p(-3.0, 4.0), p(-5.0, 2.0), p(3.0, -6.0), p(5.0, -4.0), p(-3.0, 4.0)]);
+            stroke!(&[p(-5.0, 2.0), p(-6.5, 5.5), p(-3.0, 4.0)]);
+            painter.line(&[p(-7.0, 7.5), p(7.0, 7.5)], 2.5 * s, Color32::from_rgb(0xFF, 0xD8, 0x3D));
         }
         Glyph::Eraser => {
-            line(&[p(-7.0, 2.0), p(1.0, -6.0), p(7.0, 0.0), p(1.0, 6.0), p(-3.0, 6.0), p(-7.0, 2.0)]);
-            line(&[p(-3.0, -2.0), p(3.0, 4.0)]);
-            line(&[p(1.0, 6.0), p(7.0, 6.0)]);
+            stroke!(&[p(-7.0, 2.0), p(1.0, -6.0), p(7.0, 0.0), p(1.0, 6.0), p(-3.0, 6.0), p(-7.0, 2.0)]);
+            stroke!(&[p(-3.0, -2.0), p(3.0, 4.0)]);
+            stroke!(&[p(1.0, 6.0), p(7.0, 6.0)]);
         }
         Glyph::Arrow => {
-            line(&[p(-6.0, 6.0), p(5.0, -5.0)]);
-            painter.add(Shape::convex_polygon(vec![p(6.5, -6.5), p(0.0, -5.0), p(5.0, 0.0)], color, Stroke::NONE));
+            stroke!(&[p(-6.0, 6.0), p(5.0, -5.0)]);
+            painter.polygon(&[p(6.5, -6.5), p(0.0, -5.0), p(5.0, 0.0)], color);
         }
         Glyph::Line => {
-            line(&[p(-6.5, 6.5), p(6.5, -6.5)]);
+            stroke!(&[p(-6.5, 6.5), p(6.5, -6.5)]);
         }
         Glyph::Rect => {
-            painter.rect_stroke(rect_at(-7.0, -5.5, 14.0, 11.0), CornerRadius::same((2.0 * s) as u8), stroke, StrokeKind::Middle);
+            painter.rect_stroke(rect_at(-7.0, -5.5, 14.0, 11.0), 2.0 * s, width, color);
         }
         Glyph::Ellipse => {
-            ellipse(painter, c, vec2(7.0, 5.5) * s, stroke);
+            ellipse(painter, c, vec2(7.0, 5.5) * s, width, color);
         }
         Glyph::Text => {
-            line(&[p(-6.0, -6.0), p(6.0, -6.0)]);
-            line(&[p(0.0, -6.0), p(0.0, 7.0)]);
-            line(&[p(-2.5, 7.0), p(2.5, 7.0)]);
+            stroke!(&[p(-6.0, -6.0), p(6.0, -6.0)]);
+            stroke!(&[p(0.0, -6.0), p(0.0, 7.0)]);
+            stroke!(&[p(-2.5, 7.0), p(2.5, 7.0)]);
         }
         Glyph::Step => {
-            painter.circle_stroke(c, 7.0 * s, stroke);
-            painter.text(c + vec2(0.0, 0.3 * s), eframe::egui::Align2::CENTER_CENTER, "1", crate::ui_kit::semibold(10.0 * s), color);
+            painter.circle_stroke(c, 7.0 * s, width, color);
+            // Eine „1“ aus Linien – unabhängig von der Schrift.
+            painter.line(&[p(-1.8, -2.2), p(0.6, -4.0), p(0.6, 4.0)], width, color);
         }
         Glyph::Redact => {
             let r = rect_at(-7.0, -6.0, 14.0, 12.0);
-            painter.rect_stroke(r, CornerRadius::same((1.5 * s) as u8), stroke, StrokeKind::Middle);
+            painter.rect_stroke(r, 1.5 * s, width, color);
             for (i, (x, y)) in [(0, 0), (2, 0), (1, 1), (3, 1), (0, 2), (2, 2)].iter().enumerate() {
                 let cell = Rect::from_min_size(r.min + vec2(*x as f32, *y as f32) * 3.5 * s + vec2(0.0, 0.0), vec2(3.5, 4.0) * s);
                 let alpha = if i % 2 == 0 { 1.0 } else { 0.6 };
@@ -96,20 +105,20 @@ pub fn paint(glyph: Glyph, painter: &Painter, rect: Rect, color: Color32) {
             }
         }
         Glyph::Spotlight => {
-            painter.rect_filled(rect_at(-8.0, -7.0, 16.0, 14.0), CornerRadius::same((2.0 * s) as u8), color.gamma_multiply(0.35));
+            painter.rect_filled(rect_at(-8.0, -7.0, 16.0, 14.0), 2.0 * s, color.gamma_multiply(0.35));
             painter.circle_filled(c, 4.5 * s, color);
         }
         Glyph::Crop => {
-            line(&[p(-4.0, -8.0), p(-4.0, 4.0), p(8.0, 4.0)]);
-            line(&[p(-8.0, -4.0), p(4.0, -4.0), p(4.0, 8.0)]);
+            stroke!(&[p(-4.0, -8.0), p(-4.0, 4.0), p(8.0, 4.0)]);
+            stroke!(&[p(-8.0, -4.0), p(4.0, -4.0), p(4.0, 8.0)]);
         }
         Glyph::New => {
-            line(&[p(0.0, -6.5), p(0.0, 6.5)]);
-            line(&[p(-6.5, 0.0), p(6.5, 0.0)]);
+            stroke!(&[p(0.0, -6.5), p(0.0, 6.5)]);
+            stroke!(&[p(-6.5, 0.0), p(6.5, 0.0)]);
         }
         Glyph::Open => {
-            line(&[p(-7.0, 6.0), p(-7.0, -6.0), p(-2.5, -6.0), p(-1.0, -4.0), p(6.0, -4.0), p(6.0, -1.0)]);
-            line(&[p(-7.0, 6.0), p(-4.5, -1.0), p(8.0, -1.0), p(5.5, 6.0), p(-7.0, 6.0)]);
+            stroke!(&[p(-7.0, 6.0), p(-7.0, -6.0), p(-2.5, -6.0), p(-1.0, -4.0), p(6.0, -4.0), p(6.0, -1.0)]);
+            stroke!(&[p(-7.0, 6.0), p(-4.5, -1.0), p(8.0, -1.0), p(5.5, 6.0), p(-7.0, 6.0)]);
         }
         Glyph::Undo | Glyph::Redo => {
             let flip = if glyph == Glyph::Redo { -1.0 } else { 1.0 };
@@ -120,28 +129,28 @@ pub fn paint(glyph: Glyph, painter: &Painter, rect: Rect, color: Color32) {
                 points.push(q(1.0 + 5.0 * a.cos(), 2.0 + 5.0 * a.sin()));
             }
             points.push(q(-3.0, 7.0));
-            line(&points);
-            line(&[q(-2.0, -5.5), q(-5.5, -2.0), q(-2.0, 1.5)]);
+            stroke!(&points);
+            stroke!(&[q(-2.0, -5.5), q(-5.5, -2.0), q(-2.0, 1.5)]);
         }
         Glyph::Copy => {
-            painter.rect_stroke(rect_at(-3.5, -3.5, 10.0, 11.0), CornerRadius::same((1.5 * s) as u8), stroke, StrokeKind::Middle);
-            line(&[p(-6.5, 4.0), p(-6.5, -7.5), p(3.0, -7.5)]);
+            painter.rect_stroke(rect_at(-3.5, -3.5, 10.0, 11.0), 1.5 * s, width, color);
+            stroke!(&[p(-6.5, 4.0), p(-6.5, -7.5), p(3.0, -7.5)]);
         }
         Glyph::Save => {
-            line(&[p(0.0, -7.0), p(0.0, 3.0)]);
-            line(&[p(-4.0, -1.0), p(0.0, 3.0), p(4.0, -1.0)]);
-            line(&[p(-7.0, 3.0), p(-7.0, 7.0), p(7.0, 7.0), p(7.0, 3.0)]);
+            stroke!(&[p(0.0, -7.0), p(0.0, 3.0)]);
+            stroke!(&[p(-4.0, -1.0), p(0.0, 3.0), p(4.0, -1.0)]);
+            stroke!(&[p(-7.0, 3.0), p(-7.0, 7.0), p(7.0, 7.0), p(7.0, 3.0)]);
         }
         Glyph::OcrText => {
             for (a, b) in [((-7.0, -3.0), (-7.0, -7.0)), ((-7.0, -7.0), (-3.0, -7.0))] {
-                line(&[p(a.0, a.1), p(b.0, b.1)]);
+                stroke!(&[p(a.0, a.1), p(b.0, b.1)]);
             }
-            line(&[p(3.0, -7.0), p(7.0, -7.0), p(7.0, -3.0)]);
-            line(&[p(7.0, 3.0), p(7.0, 7.0), p(3.0, 7.0)]);
-            line(&[p(-3.0, 7.0), p(-7.0, 7.0), p(-7.0, 3.0)]);
-            line(&[p(-3.5, -2.0), p(3.5, -2.0)]);
-            line(&[p(-3.5, 1.0), p(3.5, 1.0)]);
-            line(&[p(-3.5, 4.0), p(1.0, 4.0)]);
+            stroke!(&[p(3.0, -7.0), p(7.0, -7.0), p(7.0, -3.0)]);
+            stroke!(&[p(7.0, 3.0), p(7.0, 7.0), p(3.0, 7.0)]);
+            stroke!(&[p(-3.0, 7.0), p(-7.0, 7.0), p(-7.0, 3.0)]);
+            stroke!(&[p(-3.5, -2.0), p(3.5, -2.0)]);
+            stroke!(&[p(-3.5, 1.0), p(3.5, 1.0)]);
+            stroke!(&[p(-3.5, 4.0), p(1.0, 4.0)]);
         }
         Glyph::AutoRedact => {
             painter.rect_filled(rect_at(-7.5, -5.0, 9.0, 3.5), 1.0, color);
@@ -149,31 +158,32 @@ pub fn paint(glyph: Glyph, painter: &Painter, rect: Rect, color: Color32) {
             // Funkeln: „automatisch“.
             let star = p(4.5, -1.5);
             for (dx, dy) in [(0.0, -4.5), (0.0, 4.5), (-4.5, 0.0), (4.5, 0.0)] {
-                painter.line_segment([star, star + vec2(dx, dy) * s], stroke);
+                painter.line(&[star, star + vec2(dx, dy) * s], width, color);
             }
         }
         Glyph::Pin => {
-            line(&[p(-2.0, -7.0), p(6.0, 1.0)]);
-            line(&[p(-3.5, -3.0), p(2.0, 2.5)]);
-            line(&[p(0.0, -5.0), p(-5.0, 0.0), p(4.0, 3.0), p(0.0, -5.0)]);
-            line(&[p(-1.0, 3.0), p(-7.0, 9.0)]);
+            stroke!(&[p(-2.0, -7.0), p(6.0, 1.0)]);
+            stroke!(&[p(-3.5, -3.0), p(2.0, 2.5)]);
+            stroke!(&[p(0.0, -5.0), p(-5.0, 0.0), p(4.0, 3.0), p(0.0, -5.0)]);
+            stroke!(&[p(-1.0, 3.0), p(-7.0, 9.0)]);
         }
         Glyph::ModeRect => {
-            painter.add(Shape::dashed_line(
+            painter.dashed_line(
                 &[p(-7.0, -5.5), p(7.0, -5.5), p(7.0, 5.5), p(-7.0, 5.5), p(-7.0, -5.5)],
-                stroke,
+                width,
+                color,
                 2.5 * s,
                 2.0 * s,
-            ));
+            );
         }
         Glyph::ModeWindow => {
-            painter.rect_stroke(rect_at(-7.5, -6.0, 15.0, 12.0), CornerRadius::same((1.5 * s) as u8), stroke, StrokeKind::Middle);
-            line(&[p(-7.5, -2.5), p(7.5, -2.5)]);
+            painter.rect_stroke(rect_at(-7.5, -6.0, 15.0, 12.0), 1.5 * s, width, color);
+            stroke!(&[p(-7.5, -2.5), p(7.5, -2.5)]);
         }
         Glyph::ModeScreen => {
-            painter.rect_stroke(rect_at(-8.0, -6.5, 16.0, 10.5), CornerRadius::same((1.5 * s) as u8), stroke, StrokeKind::Middle);
-            line(&[p(-3.0, 7.0), p(3.0, 7.0)]);
-            line(&[p(0.0, 4.0), p(0.0, 7.0)]);
+            painter.rect_stroke(rect_at(-8.0, -6.5, 16.0, 10.5), 1.5 * s, width, color);
+            stroke!(&[p(-3.0, 7.0), p(3.0, 7.0)]);
+            stroke!(&[p(0.0, 4.0), p(0.0, 7.0)]);
         }
         Glyph::ModeFreeform => {
             let points: Vec<Pos2> = (0..=24)
@@ -183,51 +193,62 @@ pub fn paint(glyph: Glyph, painter: &Painter, rect: Rect, color: Color32) {
                     p(r * a.cos(), r * 0.8 * a.sin())
                 })
                 .collect();
-            painter.add(Shape::dashed_line(&points, stroke, 2.5 * s, 2.0 * s));
+            painter.dashed_line(&points, width, color, 2.5 * s, 2.0 * s);
         }
         Glyph::Close => {
-            line(&[p(-5.0, -5.0), p(5.0, 5.0)]);
-            line(&[p(5.0, -5.0), p(-5.0, 5.0)]);
+            stroke!(&[p(-5.0, -5.0), p(5.0, 5.0)]);
+            stroke!(&[p(5.0, -5.0), p(-5.0, 5.0)]);
         }
     }
 }
 
-fn ellipse(painter: &Painter, c: Pos2, radius: eframe::egui::Vec2, stroke: Stroke) {
-    let points = (0..32)
+fn ellipse(painter: &mut Painter, c: Pos2, radius: crate::geom::Vec2, width: f32, color: Color32) {
+    let points: Vec<Pos2> = (0..32)
         .map(|i| {
             let a = i as f32 / 32.0 * std::f32::consts::TAU;
             pos2(c.x + radius.x * a.cos(), c.y + radius.y * a.sin())
         })
         .collect();
-    painter.add(Shape::closed_line(points, stroke));
+    painter.closed_line(&points, width, color);
 }
 
 /// Quadratischer Knopf mit Symbol; `selected` hinterlegt ihn in Akzentfarbe.
-pub fn button(ui: &mut eframe::egui::Ui, glyph: Glyph, selected: bool, enabled: bool, tooltip: &str) -> eframe::egui::Response {
-    use eframe::egui::Sense;
-    let size = vec2(32.0, 30.0);
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (rect, response) = ui.allocate_exact_size(size, sense);
-    let painter = ui.painter();
-    let radius = CornerRadius::same(6);
-    if selected {
-        painter.rect_filled(rect, radius, crate::ui_kit::tint(crate::ui_kit::ACCENT, 0.28));
-        painter.rect_stroke(rect, radius, Stroke::new(1.0, crate::ui_kit::tint(crate::ui_kit::ACCENT, 0.7)), StrokeKind::Inside);
-    } else if enabled && response.hovered() {
-        painter.rect_filled(rect, radius, Color32::from_rgb(0x3A, 0x3C, 0x42));
-    }
+/// Den Klick hängt der Aufrufer mit `.on_click` an (nur wenn `enabled`).
+pub fn button(
+    id: impl Into<ElementId>,
+    glyph: Glyph,
+    selected: bool,
+    enabled: bool,
+    tooltip: impl Into<SharedString>,
+) -> Stateful<Div> {
+    let tooltip: SharedString = tooltip.into();
     let color = if !enabled {
-        crate::ui_kit::TEXT_FAINT.gamma_multiply(0.6)
+        TEXT_FAINT.gamma_multiply(0.6)
     } else if selected {
         Color32::from_rgb(0xFF, 0xB0, 0x7A)
     } else {
-        crate::ui_kit::TEXT
+        TEXT
     };
-    paint(glyph, painter, Rect::from_center_size(rect.center(), vec2(20.0, 20.0)), color);
-    let response = response.on_hover_text(tooltip);
-    if enabled {
-        response.on_hover_cursor(eframe::egui::CursorIcon::PointingHand)
-    } else {
-        response
+    let mut el = div()
+        .id(id)
+        .flex_none()
+        .w(px(32.0))
+        .h(px(30.0))
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(Color32::TRANSPARENT)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(painted(move |p, rect| paint(glyph, p, Rect::from_center_size(rect.center(), vec2(20.0, 20.0)), color)).size(px(20.0)))
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx));
+    if selected {
+        el = el.bg(tint(ACCENT, 0.28)).border_color(tint(ACCENT, 0.7));
+    } else if enabled {
+        el = el.hover(|s| s.bg(Color32::from_rgb(0x3A, 0x3C, 0x42)));
     }
+    if enabled {
+        el = el.cursor_pointer();
+    }
+    el
 }

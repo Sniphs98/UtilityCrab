@@ -5,6 +5,7 @@ mod clipboard;
 mod convert;
 mod crab_pixels;
 mod download;
+mod geom;
 mod icon;
 mod lang;
 mod ocr;

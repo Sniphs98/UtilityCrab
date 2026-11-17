@@ -60,6 +60,8 @@ cargo run --release
 
 Use the release build for everyday use. The neural voices are noticeably slower in debug builds.
 
+The windows (settings, converter, screenshot editor and overlay, pinned images, popups) are built with [GPUI](https://www.gpui.rs) through [gpui-kit](https://crates.io/crates/gpui-kit), which bundles GPUI with the gpui-component widgets. Shared building blocks (sections, rows, buttons, a small `Painter` for custom vector drawing) are in `src/ui_kit.rs`, and egui-free geometry and colors are in `src/geom.rs`. GPUI runs one application per process, so every window type is opened in its own process, as before.
+
 ### Installer
 
 Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`).
@@ -82,10 +84,10 @@ The editor lives in `src/screenshot` and is built so new features are mostly one
 |---|---|
 | New drawing tool | implement `Tool` (or use `DragTool` with a `make` function) and add it to `tools::all()` in `tools.rs`; toolbar button, shortcut, options bar and remembered style come with it |
 | New kind of mark on the image | implement `Annotation` in `annotations.rs` (render onto a `Canvas`, bounds, hit test, move) |
-| New toolbar action | add an `ActionDef` to `ACTIONS` in `editor.rs` (button, tooltip, shortcut, optional menu) |
+| New toolbar action | add an `ActionDef` to `ACTIONS` in `editor.rs` (button, tooltip, shortcut, optional dropdown menu) |
 | New pattern for automatic redaction | add a `Pattern` to `PATTERNS` in `redact.rs` |
 | New capture mode | add a variant to `CaptureMode` in `overlay.rs` |
-| New icon | add a `Glyph` in `icons.rs` |
+| New icon | add a `Glyph` in `icons.rs` and draw it in `paint()` with the `Painter` |
 
 The live preview renders the annotation being drawn onto a copy of just its area, with the same code as the final image, so what you see is exactly what gets saved.
 
