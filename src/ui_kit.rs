@@ -99,74 +99,76 @@ pub fn run_app(setup: impl FnOnce(&mut App) + 'static) {
 /// Dunkles Thema mit der orangen Akzentfarbe und Segoe UI.
 pub fn apply_theme(cx: &mut App) {
     Theme::change(ThemeMode::Dark, None, cx);
-    let theme = Theme::global_mut(cx);
-    theme.font_family = FONT.into();
-    theme.font_size = px(BODY_SIZE);
-    theme.radius = px(6.0);
-    theme.radius_lg = px(10.0);
-    theme.shadow = true;
+    // Über `update`, damit auch die Tokens (daraus nehmen z. B. Knöpfe und Regler ihre
+    // Hintergründe) die neuen Farben bekommen. `global_mut` ändert nur `colors`.
+    Theme::update(cx, |theme| {
+        theme.font_family = FONT.into();
+        theme.font_size = px(BODY_SIZE);
+        theme.radius = px(6.0);
+        theme.radius_lg = px(10.0);
+        theme.shadow = true;
 
-    let c = &mut theme.colors;
-    c.background = CONTENT_BG.into();
-    c.foreground = TEXT.into();
-    c.border = DIVIDER.into();
-    c.input = DIVIDER.into();
-    c.muted = GROUP_BG.into();
-    c.muted_foreground = TEXT_WEAK.into();
-    c.popover = GROUP_BG.into();
-    c.popover_foreground = TEXT.into();
-    c.accent = CONTROL.into();
-    c.accent_foreground = TEXT.into();
-    c.ring = ACCENT.into();
-    c.caret = ACCENT.into();
-    c.selection = tint(ACCENT, 0.45).into();
-    c.link = ACCENT.into();
-    c.link_hover = Color32::from_rgb(0xFF, 0x8A, 0x45).into();
-    c.link_active = ACCENT.into();
+        let c = &mut theme.colors;
+        c.background = CONTENT_BG.into();
+        c.foreground = TEXT.into();
+        c.border = DIVIDER.into();
+        c.input = DIVIDER.into();
+        c.muted = GROUP_BG.into();
+        c.muted_foreground = TEXT_WEAK.into();
+        c.popover = GROUP_BG.into();
+        c.popover_foreground = TEXT.into();
+        c.accent = CONTROL.into();
+        c.accent_foreground = TEXT.into();
+        c.ring = ACCENT.into();
+        c.caret = ACCENT.into();
+        c.selection = tint(ACCENT, 0.45).into();
+        c.link = ACCENT.into();
+        c.link_hover = Color32::from_rgb(0xFF, 0x8A, 0x45).into();
+        c.link_active = ACCENT.into();
 
-    c.primary = ACCENT.into();
-    c.primary_hover = Color32::from_rgb(0xF0, 0x7A, 0x30).into();
-    c.primary_active = Color32::from_rgb(0xD0, 0x5C, 0x14).into();
-    c.primary_foreground = Color32::WHITE.into();
-    c.button_primary = c.primary;
-    c.button_primary_hover = c.primary_hover;
-    c.button_primary_active = c.primary_active;
-    c.button_primary_foreground = c.primary_foreground;
+        c.primary = ACCENT.into();
+        c.primary_hover = Color32::from_rgb(0xF0, 0x7A, 0x30).into();
+        c.primary_active = Color32::from_rgb(0xD0, 0x5C, 0x14).into();
+        c.primary_foreground = Color32::WHITE.into();
+        c.button_primary = c.primary;
+        c.button_primary_hover = c.primary_hover;
+        c.button_primary_active = c.primary_active;
+        c.button_primary_foreground = c.primary_foreground;
 
-    c.secondary = CONTROL.into();
-    c.secondary_hover = CONTROL_HOVER.into();
-    c.secondary_active = CONTROL_ACTIVE.into();
-    c.secondary_foreground = TEXT.into();
-    c.button = CONTROL.into();
-    c.button_hover = CONTROL_HOVER.into();
-    c.button_active = CONTROL_ACTIVE.into();
-    c.button_foreground = TEXT.into();
-    c.button_secondary = c.secondary;
-    c.button_secondary_hover = c.secondary_hover;
-    c.button_secondary_active = c.secondary_active;
-    c.button_secondary_foreground = c.secondary_foreground;
+        c.secondary = CONTROL.into();
+        c.secondary_hover = CONTROL_HOVER.into();
+        c.secondary_active = CONTROL_ACTIVE.into();
+        c.secondary_foreground = TEXT.into();
+        c.button = CONTROL.into();
+        c.button_hover = CONTROL_HOVER.into();
+        c.button_active = CONTROL_ACTIVE.into();
+        c.button_foreground = TEXT.into();
+        c.button_secondary = c.secondary;
+        c.button_secondary_hover = c.secondary_hover;
+        c.button_secondary_active = c.secondary_active;
+        c.button_secondary_foreground = c.secondary_foreground;
 
-    c.danger = DANGER.into();
-    c.danger_hover = Color32::from_rgb(0xC8, 0x48, 0x3B).into();
-    c.danger_active = Color32::from_rgb(0xA0, 0x30, 0x25).into();
-    c.danger_foreground = Color32::WHITE.into();
-    c.button_danger = c.danger;
-    c.button_danger_hover = c.danger_hover;
-    c.button_danger_active = c.danger_active;
-    c.button_danger_foreground = c.danger_foreground;
+        c.danger = DANGER.into();
+        c.danger_hover = Color32::from_rgb(0xC8, 0x48, 0x3B).into();
+        c.danger_active = Color32::from_rgb(0xA0, 0x30, 0x25).into();
+        c.danger_foreground = Color32::WHITE.into();
+        c.button_danger = c.danger;
+        c.button_danger_hover = c.danger_hover;
+        c.button_danger_active = c.danger_active;
+        c.button_danger_foreground = c.danger_foreground;
 
-    c.success = GREEN.into();
-    c.progress_bar = ACCENT.into();
-    c.slider_bar = ACCENT.into();
-    c.slider_thumb = Color32::WHITE.into();
-    c.list_hover = CONTROL.into();
-    c.list_active = tint(ACCENT, 0.25).into();
-    c.list_active_border = ACCENT.into();
-    c.sidebar = SIDEBAR_BG.into();
-    c.scrollbar = Color32::TRANSPARENT.into();
-    c.scrollbar_thumb = Color32::from_rgb(0x4A, 0x4D, 0x55).into();
-    c.scrollbar_thumb_hover = Color32::from_rgb(0x5A, 0x5E, 0x66).into();
-    cx.refresh_windows();
+        c.success = GREEN.into();
+        c.progress_bar = ACCENT.into();
+        c.slider_bar = ACCENT.into();
+        c.slider_thumb = Color32::WHITE.into();
+        c.list_hover = CONTROL.into();
+        c.list_active = tint(ACCENT, 0.25).into();
+        c.list_active_border = ACCENT.into();
+        c.sidebar = SIDEBAR_BG.into();
+        c.scrollbar = Color32::TRANSPARENT.into();
+        c.scrollbar_thumb = Color32::from_rgb(0x4A, 0x4D, 0x55).into();
+        c.scrollbar_thumb_hover = Color32::from_rgb(0x5A, 0x5E, 0x66).into();
+    });
 }
 
 /// Fensteroptionen für ein normales Fenster mit Titelleiste.
