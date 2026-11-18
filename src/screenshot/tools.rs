@@ -8,15 +8,22 @@
 //! 3. In [`all`] eintragen – Werkzeugleiste, Tastenkürzel, Optionen (Farbe, Stärke …)
 //!    und gemerkte Einstellungen kommen dann automatisch.
 //! 4. Optional ein Symbol in `icons.rs` zeichnen.
+//!
+//! Tastenkürzel sind GPUI-Tastennamen („a“, „delete“, „enter“ …). Eigene Oberfläche über dem
+//! Bild beschreibt ein Werkzeug nur ([`Tool::paint_overlay`], [`Tool::controls`],
+//! [`Tool::text_entry`]); gezeichnet und bedient wird sie vom Editor.
 
-use eframe::egui::{self, pos2, vec2, Color32, CursorIcon, Key, Pos2, Rect, Stroke, Ui};
+use gpui_kit::CursorStyle;
+
+use crate::geom::{lerp, pos2, vec2, Color32, Pos2, Rect};
+use crate::ui_kit::Painter;
 
 use super::annotations::{
     drag_rect, snap_angle, Annotation, Freehand, Line, Redact, Shape, ShapeKind, Spotlight, Step, Style,
     Text,
 };
 use super::canvas::IRect;
-use super::document::History;
+use super::document::{Document, History};
 use super::icons::Glyph;
 use super::view::View;
 
@@ -37,6 +44,16 @@ pub enum Input {
     Release(Pos2),
 }
 
+/// Knöpfe (und eine Beschriftung) über dem Bild, z. B. „Abbrechen“/„Zuschneiden“.
+pub struct Controls {
+    /// Beschriftung: linke untere Ecke in Fensterkoordinaten und Text.
+    pub label: Option<(Pos2, String)>,
+    /// Rechte obere Ecke der Knopfgruppe (Fensterkoordinaten).
+    pub anchor: Pos2,
+    /// Kennung (geht an [`Tool::command`]), Beschriftung, Hauptaktion?
+    pub buttons: Vec<(&'static str, &'static str, bool)>,
+}
+
 /// Einstellungen, die in der Optionsleiste für ein Werkzeug erscheinen.
 #[derive(Debug, Clone, Copy)]
 pub enum Opt {
@@ -54,7 +71,8 @@ pub trait Tool {
     fn label(&self) -> &'static str;
     /// Kurze Bedienhilfe für die Statuszeile.
     fn hint(&self) -> &'static str;
-    fn shortcut(&self) -> Option<Key>;
+    /// GPUI-Tastenname ohne Umschalttasten, z. B. „a“.
+    fn shortcut(&self) -> Option<&'static str>;
     fn glyph(&self) -> Glyph;
     fn default_style(&self) -> Style {
         Style::default()
@@ -62,8 +80,8 @@ pub trait Tool {
     fn options(&self) -> &'static [Opt] {
         &[]
     }
-    fn cursor(&self) -> CursorIcon {
-        CursorIcon::Crosshair
+    fn cursor(&self) -> CursorStyle {
+        CursorStyle::Crosshair
     }
 
     fn pointer(&mut self, input: Input, cx: &mut ToolCtx);
@@ -73,11 +91,27 @@ pub trait Tool {
         None
     }
 
-    /// Eigene Oberfläche über dem Bild (Textfeld, Zuschneiderahmen, Auswahl …).
-    fn overlay(&mut self, _ui: &mut Ui, _cx: &mut ToolCtx) {}
+    /// Hilfslinien über dem Bild (Auswahlrahmen, Zuschneiden), in Fensterkoordinaten.
+    fn paint_overlay(&self, _p: &mut Painter, _view: View, _doc: &Document) {}
 
-    /// Tastendruck, solange das Werkzeug aktiv ist. `true` = verbraucht.
-    fn key(&mut self, _key: Key, _cx: &mut ToolCtx) -> bool {
+    /// Knöpfe über dem Bild; ein Klick kommt als [`Tool::command`] zurück.
+    fn controls(&self, _view: View, _doc: &Document) -> Option<Controls> {
+        None
+    }
+
+    fn command(&mut self, _id: &str, _cx: &mut ToolCtx) {}
+
+    /// Soll gerade ein Textfeld über dem Bild stehen? Linke obere Ecke in Bildpixeln;
+    /// Schriftgröße und Farbe kommen aus dem Stil des Werkzeugs.
+    fn text_entry(&self) -> Option<Pos2> {
+        None
+    }
+
+    /// Text aus dem Feld übernehmen (`Some`) oder verwerfen (`None`).
+    fn text_done(&mut self, _text: Option<String>, _cx: &mut ToolCtx) {}
+
+    /// Tastendruck (GPUI-Tastenname), solange das Werkzeug aktiv ist. `true` = verbraucht.
+    fn key(&mut self, _key: &str, _cx: &mut ToolCtx) -> bool {
         false
     }
 
@@ -103,7 +137,7 @@ pub fn all() -> Vec<Option<Box<dyn Tool>>> {
             "pfeil",
             "Pfeil",
             "Ziehen für einen Pfeil · Umschalt rastet 45° ein",
-            Key::A,
+            "a",
             Glyph::Arrow,
             STROKE_OPTS,
             Style::default(),
@@ -124,7 +158,7 @@ pub fn all() -> Vec<Option<Box<dyn Tool>>> {
             "linie",
             "Linie",
             "Ziehen für eine Linie · Umschalt rastet 45° ein",
-            Key::L,
+            "l",
             Glyph::Line,
             STROKE_OPTS,
             Style::default(),
@@ -145,7 +179,7 @@ pub fn all() -> Vec<Option<Box<dyn Tool>>> {
             "rechteck",
             "Rechteck",
             "Ziehen für ein Rechteck · Umschalt für ein Quadrat",
-            Key::R,
+            "r",
             Glyph::Rect,
             SHAPE_OPTS,
             Style::default(),
@@ -155,7 +189,7 @@ pub fn all() -> Vec<Option<Box<dyn Tool>>> {
             "ellipse",
             "Ellipse",
             "Ziehen für eine Ellipse · Umschalt für einen Kreis",
-            Key::E,
+            "e",
             Glyph::Ellipse,
             SHAPE_OPTS,
             Style::default(),
@@ -168,7 +202,7 @@ pub fn all() -> Vec<Option<Box<dyn Tool>>> {
             "unkenntlich",
             "Unkenntlich machen",
             "Bereich aufziehen, der verpixelt, weichgezeichnet oder geschwärzt wird",
-            Key::U,
+            "u",
             Glyph::Redact,
             &[Opt::Redact, Opt::Width { label: "Stärke", min: 4.0, max: 40.0 }, Opt::SoftEdge],
             Style {
@@ -191,7 +225,7 @@ pub fn all() -> Vec<Option<Box<dyn Tool>>> {
             "spotlight",
             "Spotlight",
             "Bereich aufziehen, der hervorgehoben wird – der Rest wird abgedunkelt",
-            Key::S,
+            "s",
             Glyph::Spotlight,
             &[
                 Opt::Width { label: "Abdunkeln", min: 10.0, max: 90.0 },
@@ -245,7 +279,7 @@ pub struct DragTool {
     id: &'static str,
     label: &'static str,
     hint: &'static str,
-    key: Key,
+    key: &'static str,
     glyph: Glyph,
     options: &'static [Opt],
     default: Style,
@@ -260,7 +294,7 @@ impl DragTool {
         id: &'static str,
         label: &'static str,
         hint: &'static str,
-        key: Key,
+        key: &'static str,
         glyph: Glyph,
         options: &'static [Opt],
         default: Style,
@@ -291,7 +325,7 @@ impl Tool for DragTool {
     fn hint(&self) -> &'static str {
         self.hint
     }
-    fn shortcut(&self) -> Option<Key> {
+    fn shortcut(&self) -> Option<&'static str> {
         Some(self.key)
     }
     fn glyph(&self) -> Glyph {
@@ -377,8 +411,8 @@ impl Tool for FreehandTool {
             "Frei zeichnen"
         }
     }
-    fn shortcut(&self) -> Option<Key> {
-        Some(if self.highlighter { Key::M } else { Key::P })
+    fn shortcut(&self) -> Option<&'static str> {
+        Some(if self.highlighter { "m" } else { "p" })
     }
     fn glyph(&self) -> Glyph {
         if self.highlighter {
@@ -468,14 +502,14 @@ impl Tool for EraserTool {
     fn hint(&self) -> &'static str {
         "Über Anmerkungen fahren, um sie zu entfernen"
     }
-    fn shortcut(&self) -> Option<Key> {
-        Some(Key::X)
+    fn shortcut(&self) -> Option<&'static str> {
+        Some("x")
     }
     fn glyph(&self) -> Glyph {
         Glyph::Eraser
     }
-    fn cursor(&self) -> CursorIcon {
-        CursorIcon::Cell
+    fn cursor(&self) -> CursorStyle {
+        CursorStyle::Crosshair
     }
 
     fn pointer(&mut self, input: Input, cx: &mut ToolCtx) {
@@ -510,14 +544,14 @@ impl Tool for SelectTool {
     fn hint(&self) -> &'static str {
         "Anmerkung anklicken und verschieben · Entf löscht sie"
     }
-    fn shortcut(&self) -> Option<Key> {
-        Some(Key::V)
+    fn shortcut(&self) -> Option<&'static str> {
+        Some("v")
     }
     fn glyph(&self) -> Glyph {
         Glyph::Select
     }
-    fn cursor(&self) -> CursorIcon {
-        CursorIcon::Default
+    fn cursor(&self) -> CursorStyle {
+        CursorStyle::Arrow
     }
 
     fn pointer(&mut self, input: Input, cx: &mut ToolCtx) {
@@ -546,26 +580,25 @@ impl Tool for SelectTool {
         }
     }
 
-    fn overlay(&mut self, ui: &mut Ui, cx: &mut ToolCtx) {
-        let Some(item) = self.selected.and_then(|i| cx.history.doc.items.get(i)) else {
-            self.selected = None;
+    fn paint_overlay(&self, p: &mut Painter, view: View, doc: &Document) {
+        let Some(item) = self.selected.and_then(|i| doc.items.get(i)) else {
             return;
         };
-        let bounds = item.bounds().intersect(cx.history.doc.image_rect());
-        let rect = cx.view.rect_to_screen(bounds).expand(3.0);
-        dashed_rect(ui.painter(), rect, Color32::WHITE, ui_accent());
+        let bounds = item.bounds().intersect(doc.image_rect());
+        let rect = view.rect_to_screen(bounds).expand(3.0);
+        dashed_rect(p, rect, Color32::WHITE, ui_accent());
     }
 
-    fn key(&mut self, key: Key, cx: &mut ToolCtx) -> bool {
+    fn key(&mut self, key: &str, cx: &mut ToolCtx) -> bool {
         match (key, self.selected) {
-            (Key::Delete | Key::Backspace, Some(index)) if index < cx.history.doc.items.len() => {
+            ("delete" | "backspace", Some(index)) if index < cx.history.doc.items.len() => {
                 cx.history.edit(|doc| {
                     doc.items.remove(index);
                 });
                 self.selected = None;
                 true
             }
-            (Key::Escape, Some(_)) => {
+            ("escape", Some(_)) => {
                 self.selected = None;
                 true
             }
@@ -589,8 +622,8 @@ impl Tool for StepTool {
     fn hint(&self) -> &'static str {
         "Klicken setzt fortlaufende Nummern 1, 2, 3 … für Anleitungen"
     }
-    fn shortcut(&self) -> Option<Key> {
-        Some(Key::N)
+    fn shortcut(&self) -> Option<&'static str> {
+        Some("n")
     }
     fn glyph(&self) -> Glyph {
         Glyph::Step
@@ -604,8 +637,8 @@ impl Tool for StepTool {
     fn options(&self) -> &'static [Opt] {
         &[Opt::Color, Opt::Width { label: "Größe", min: 8.0, max: 60.0 }]
     }
-    fn cursor(&self) -> CursorIcon {
-        CursorIcon::PointingHand
+    fn cursor(&self) -> CursorStyle {
+        CursorStyle::PointingHand
     }
 
     fn pointer(&mut self, input: Input, cx: &mut ToolCtx) {
@@ -626,25 +659,8 @@ impl Tool for StepTool {
 
 #[derive(Default)]
 pub struct TextTool {
-    editing: Option<(Pos2, String)>,
-    focus: bool,
-}
-
-impl TextTool {
-    fn commit(&mut self, cx: &mut ToolCtx) {
-        if let Some((pos, text)) = self.editing.take() {
-            let text = text.trim_end().to_string();
-            if !text.trim().is_empty() {
-                cx.history.push(Box::new(Text {
-                    pos,
-                    text,
-                    size: cx.style.width,
-                    color: cx.style.color(),
-                    boxed: cx.style.filled,
-                }));
-            }
-        }
-    }
+    /// Wo gerade getippt wird (Bildpixel). Den Text selbst hält das Textfeld des Editors.
+    editing: Option<Pos2>,
 }
 
 impl Tool for TextTool {
@@ -657,8 +673,8 @@ impl Tool for TextTool {
     fn hint(&self) -> &'static str {
         "Klicken und tippen · Enter übernimmt, Umschalt+Enter für eine neue Zeile"
     }
-    fn shortcut(&self) -> Option<Key> {
-        Some(Key::T)
+    fn shortcut(&self) -> Option<&'static str> {
+        Some("t")
     }
     fn glyph(&self) -> Glyph {
         Glyph::Text
@@ -676,75 +692,41 @@ impl Tool for TextTool {
             Opt::Filled("Hinterlegt"),
         ]
     }
-    fn cursor(&self) -> CursorIcon {
-        CursorIcon::Text
+    fn cursor(&self) -> CursorStyle {
+        CursorStyle::IBeam
     }
 
-    fn pointer(&mut self, input: Input, cx: &mut ToolCtx) {
+    fn pointer(&mut self, input: Input, _cx: &mut ToolCtx) {
+        // Ein Klick daneben übernimmt den Text – das erledigt der Editor über `text_done`,
+        // bevor er den Klick hierher gibt.
         if let Input::Press(p) = input {
-            if self.editing.is_some() {
-                // Klick daneben übernimmt den Text.
-                self.commit(cx);
-            } else {
-                self.editing = Some((p, String::new()));
-                self.focus = true;
+            if self.editing.is_none() {
+                self.editing = Some(p);
             }
         }
     }
 
-    fn preview(&self) -> Option<&dyn Annotation> {
-        None
+    fn text_entry(&self) -> Option<Pos2> {
+        self.editing
     }
 
-    fn overlay(&mut self, ui: &mut Ui, cx: &mut ToolCtx) {
-        let Some((pos, text)) = &mut self.editing else {
+    fn text_done(&mut self, text: Option<String>, cx: &mut ToolCtx) {
+        let Some(pos) = self.editing.take() else {
             return;
         };
-        let screen = cx.view.to_screen(*pos);
-        let size = (cx.style.width * cx.view.scale).max(8.0);
-        let color = cx.style.color();
-        let mut commit = false;
-        let mut cancel = false;
-        egui::Area::new(egui::Id::unique("text-werkzeug"))
-            .fixed_pos(screen - vec2(4.0, 4.0))
-            .order(egui::Order::Foreground)
-            .show(ui.ctx(), |ui| {
-                egui::Frame::new()
-                    .stroke(Stroke::new(1.0, ui_accent()))
-                    .fill(Color32::from_black_alpha(40))
-                    .inner_margin(egui::Margin::same(3))
-                    .show(ui, |ui| {
-                        // Breite wächst mit dem Text (grob geschätzt), das Feld bleibt so kompakt.
-                        let longest = text.lines().map(|l| l.chars().count()).max().unwrap_or(0) as f32;
-                        let width = (size * 0.62 * (longest + 2.0)).max(size * 4.0);
-                        let edit = egui::TextEdit::multiline(text)
-                            .font(egui::FontId::new(size, egui::FontFamily::Name(crate::ui_kit::SEMIBOLD.into())))
-                            .text_color(color)
-                            .frame(egui::Frame::NONE)
-                            .desired_rows(1)
-                            .desired_width(width)
-                            .hint_text("Text …")
-                            .return_key(Some(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Enter)));
-                        let response = ui.add(edit);
-                        if self.focus {
-                            response.request_focus();
-                            self.focus = false;
-                        }
-                        if response.has_focus() {
-                            commit = ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
-                            cancel = ui.input(|i| i.key_pressed(Key::Escape));
-                        }
-                    });
-            });
-        if cancel {
-            self.editing = None;
-        } else if commit {
-            self.commit(cx);
+        let Some(text) = text else {
+            return;
+        };
+        let text = text.trim_end().to_string();
+        if !text.trim().is_empty() {
+            cx.history.push(Box::new(Text {
+                pos,
+                text,
+                size: cx.style.width,
+                color: cx.style.color(),
+                boxed: cx.style.filled,
+            }));
         }
-    }
-
-    fn deactivate(&mut self, cx: &mut ToolCtx) {
-        self.commit(cx);
     }
 
     fn typing(&self) -> bool {
@@ -804,8 +786,8 @@ impl Tool for CropTool {
     fn hint(&self) -> &'static str {
         "Bereich aufziehen, Kanten anpassen · Enter schneidet zu, Esc bricht ab"
     }
-    fn shortcut(&self) -> Option<Key> {
-        Some(Key::C)
+    fn shortcut(&self) -> Option<&'static str> {
+        Some("c")
     }
     fn glyph(&self) -> Glyph {
         Glyph::Crop
@@ -865,13 +847,12 @@ impl Tool for CropTool {
         }
     }
 
-    fn overlay(&mut self, ui: &mut Ui, cx: &mut ToolCtx) {
+    fn paint_overlay(&self, p: &mut Painter, view: View, doc: &Document) {
         let Some(rect) = self.rect else {
             return;
         };
-        let image = cx.view.rect_to_screen(cx.history.doc.image_rect());
-        let sel = cx.view.rect_to_screen(rect);
-        let painter = ui.painter();
+        let image = view.rect_to_screen(doc.image_rect());
+        let sel = view.rect_to_screen(rect);
         let dim = Color32::from_black_alpha(140);
         for r in [
             Rect::from_min_max(image.min, pos2(image.max.x, sel.min.y)),
@@ -879,59 +860,49 @@ impl Tool for CropTool {
             Rect::from_min_max(pos2(image.min.x, sel.min.y), pos2(sel.min.x, sel.max.y)),
             Rect::from_min_max(pos2(sel.max.x, sel.min.y), pos2(image.max.x, sel.max.y)),
         ] {
-            painter.rect_filled(r, 0.0, dim);
+            p.rect_filled(r, 0.0, dim);
         }
-        painter.rect_stroke(sel, 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Outside);
+        p.rect_stroke_outside(sel, 1.5, Color32::WHITE);
         // Drittel-Linien und Griffe an den Ecken.
         for i in 1..3 {
             let f = i as f32 / 3.0;
-            let x = egui::lerp(sel.min.x..=sel.max.x, f);
-            let y = egui::lerp(sel.min.y..=sel.max.y, f);
-            painter.line_segment([pos2(x, sel.min.y), pos2(x, sel.max.y)], Stroke::new(1.0, Color32::from_white_alpha(70)));
-            painter.line_segment([pos2(sel.min.x, y), pos2(sel.max.x, y)], Stroke::new(1.0, Color32::from_white_alpha(70)));
+            let x = lerp(sel.min.x, sel.max.x, f);
+            let y = lerp(sel.min.y, sel.max.y, f);
+            p.line(&[pos2(x, sel.min.y), pos2(x, sel.max.y)], 1.0, Color32::from_white_alpha(70));
+            p.line(&[pos2(sel.min.x, y), pos2(sel.max.x, y)], 1.0, Color32::from_white_alpha(70));
         }
         for corner in [sel.left_top(), sel.right_top(), sel.left_bottom(), sel.right_bottom()] {
-            painter.rect_filled(Rect::from_center_size(corner, vec2(9.0, 9.0)), 2.0, Color32::WHITE);
-        }
-        let label = format!("{} × {}", rect.width().round(), rect.height().round());
-        painter.text(
-            sel.left_top() + vec2(0.0, -6.0),
-            egui::Align2::LEFT_BOTTOM,
-            label,
-            crate::ui_kit::regular(crate::ui_kit::SMALL_SIZE),
-            Color32::WHITE,
-        );
-
-        // Knöpfe unter dem Rahmen.
-        let mut apply = false;
-        let mut cancel = false;
-        let anchor = pos2(sel.right(), (sel.bottom() + 8.0).min(ui.clip_rect().bottom() - 36.0));
-        egui::Area::new(egui::Id::unique("zuschneiden-knoepfe"))
-            .fixed_pos(anchor)
-            .pivot(egui::Align2::RIGHT_TOP)
-            .order(egui::Order::Foreground)
-            .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        cancel = ui.button("Abbrechen").clicked();
-                        apply = ui.add(crate::ui_kit::primary_button("Zuschneiden")).clicked();
-                    });
-                });
-            });
-        if apply {
-            self.apply(cx);
-        } else if cancel {
-            self.rect = None;
+            p.rect_filled(Rect::from_center_size(corner, vec2(9.0, 9.0)), 2.0, Color32::WHITE);
         }
     }
 
-    fn key(&mut self, key: Key, cx: &mut ToolCtx) -> bool {
+    fn controls(&self, view: View, _doc: &Document) -> Option<Controls> {
+        let rect = self.rect?;
+        let sel = view.rect_to_screen(rect);
+        Some(Controls {
+            label: Some((
+                sel.left_top() + vec2(0.0, -6.0),
+                format!("{} × {}", rect.width().round(), rect.height().round()),
+            )),
+            anchor: pos2(sel.right(), sel.bottom() + 8.0),
+            buttons: vec![("abbrechen", "Abbrechen", false), ("zuschneiden", "Zuschneiden", true)],
+        })
+    }
+
+    fn command(&mut self, id: &str, cx: &mut ToolCtx) {
+        match id {
+            "zuschneiden" => self.apply(cx),
+            _ => self.rect = None,
+        }
+    }
+
+    fn key(&mut self, key: &str, cx: &mut ToolCtx) -> bool {
         match key {
-            Key::Enter if self.rect.is_some() => {
+            "enter" if self.rect.is_some() => {
                 self.apply(cx);
                 true
             }
-            Key::Escape if self.rect.is_some() => {
+            "escape" if self.rect.is_some() => {
                 self.rect = None;
                 true
             }
@@ -951,8 +922,8 @@ fn ui_accent() -> Color32 {
 }
 
 /// Gestricheltes Rechteck (Auswahlrahmen).
-pub fn dashed_rect(painter: &egui::Painter, rect: Rect, a: Color32, b: Color32) {
+pub fn dashed_rect(painter: &mut Painter, rect: Rect, a: Color32, b: Color32) {
     let corners = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()];
-    painter.add(egui::Shape::line(corners.to_vec(), Stroke::new(1.0, a)));
-    painter.add(egui::Shape::dashed_line(&corners, Stroke::new(1.0, b), 5.0, 4.0));
+    painter.line(&corners, 1.0, a);
+    painter.dashed_line(&corners, 1.0, b, 5.0, 4.0);
 }

@@ -4,16 +4,27 @@
 //! darunter die Optionen des aktiven Werkzeugs, in der Mitte das Bild (zoom- und
 //! verschiebbar), unten die Statuszeile. Bilder kommen aus der Aufnahme, dem Öffnen-Dialog,
 //! per Drag & Drop, aus der Zwischenablage (Strg+V) oder dem Explorer-Kontextmenü.
+//!
+//! Koordinaten: [`View`] rechnet zwischen Bildpixeln und Fensterkoordinaten (logische Pixel
+//! von GPUI). Die Bildfläche merkt sich beim Layout ihre Lage im Fenster.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{
-    self, pos2, vec2, Align, Color32, CornerRadius, Key, KeyboardShortcut, Layout, Modifiers, Pos2, Rect,
-    RichText, Sense, Stroke, StrokeKind, Ui,
-};
+use gpui_kit::component::color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState};
+use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{Selectable, WindowExt};
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
 
 use super::annotations::{Redact, RedactMode, Style};
 use super::canvas::{Canvas, IRect};
@@ -24,8 +35,13 @@ use super::redact::{self, Found, PATTERNS};
 use super::tools::{self, Input, Opt, Tool, ToolCtx};
 use super::view::View;
 use super::{export, Prefs, CAPTURE_ARG, PIN_ARG};
+use crate::geom::{pos2, vec2, Color32, Pos2, Rect};
 use crate::settings::Settings;
-use crate::ui_kit::{self, regular, semibold, BODY_SIZE, SMALL_SIZE, TEXT, TEXT_FAINT, TEXT_WEAK};
+use crate::ui_kit::{
+    self, button, h_flex, primary_button, strong, text, v_flex, vertical_divider, Button, ButtonVariants, Disableable,
+    Painter, Sizable,
+    BODY_SIZE, SMALL_SIZE, TEXT, TEXT_FAINT, TEXT_WEAK,
+};
 
 pub enum Source {
     Empty,
@@ -34,32 +50,26 @@ pub enum Source {
 }
 
 pub fn run(source: Source) {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("UtilityCrab – Bild bearbeiten")
-            .with_inner_size([1180.0, 780.0])
-            .with_min_inner_size([760.0, 480.0])
-            .with_drag_and_drop(true)
-            .with_icon(crate::settings_ui::window_icon()),
-        ..Default::default()
-    };
-    let result = eframe::run_native(
-        "UtilityCrab-Editor",
-        options,
-        Box::new(move |cc| {
-            ui_kit::apply(&cc.egui_ctx);
-            let mut editor = Editor::new();
-            match source {
-                Source::Empty => {}
-                Source::Clipboard => editor.paste(),
-                Source::File(path) => editor.open(&path),
-            }
-            Ok(Box::new(editor))
-        }),
-    );
-    if let Err(e) = result {
-        crate::report(Err(format!("Bildeditor: {e}")));
-    }
+    ui_kit::run_app(move |cx| {
+        let options = ui_kit::window_options("UtilityCrab – Bild bearbeiten", (1180.0, 780.0), (760.0, 480.0), cx);
+        ui_kit::open_window(options, cx, move |window, cx| {
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::new(window, cx);
+                match source {
+                    Source::Empty => {}
+                    Source::Clipboard => editor.paste(),
+                    Source::File(path) => editor.open(&path),
+                }
+                editor
+            });
+            // Ungespeicherte Änderungen: erst nachfragen.
+            let weak = editor.downgrade();
+            window.on_window_should_close(cx, move |_, cx| {
+                weak.update(cx, |editor, cx| editor.should_close(cx)).unwrap_or(true)
+            });
+            editor
+        });
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -79,31 +89,36 @@ pub enum Group {
     Output,
 }
 
+/// Tastenkürzel mit Strg: (mit Umschalt?, GPUI-Tastenname).
+#[derive(Clone, Copy, PartialEq)]
+pub struct Shortcut {
+    pub shift: bool,
+    pub key: &'static str,
+}
+
+const fn ctrl(key: &'static str) -> Option<Shortcut> {
+    Some(Shortcut { shift: false, key })
+}
+
+const fn ctrl_shift(key: &'static str) -> Option<Shortcut> {
+    Some(Shortcut { shift: true, key })
+}
+
+type Run = fn(&mut Editor, &mut Window, &mut Context<Editor>);
+/// Baut das kleine Menü neben dem Knopf (Optionen der Aktion).
+type Menu = fn(&Editor, PopupMenu, WeakEntity<Editor>) -> PopupMenu;
+
 pub struct ActionDef {
     /// Dauerhafte Kennung.
     pub id: &'static str,
     pub label: &'static str,
     pub glyph: Glyph,
     pub group: Group,
-    pub shortcut: Option<KeyboardShortcut>,
+    pub shortcut: Option<Shortcut>,
     pub enabled: fn(&Editor) -> bool,
-    pub run: fn(&mut Editor, &egui::Context),
-    /// Kleines Menü neben dem Knopf (Optionen der Aktion).
-    pub menu: Option<fn(&mut Editor, &mut Ui)>,
+    pub run: Run,
+    pub menu: Option<Menu>,
 }
-
-const fn key(modifiers: Modifiers, key: Key) -> Option<KeyboardShortcut> {
-    Some(KeyboardShortcut::new(modifiers, key))
-}
-
-const CTRL: Modifiers = Modifiers::COMMAND;
-const CTRL_SHIFT: Modifiers = Modifiers {
-    alt: false,
-    ctrl: false,
-    shift: true,
-    mac_cmd: false,
-    command: true,
-};
 
 fn always(_: &Editor) -> bool {
     true
@@ -123,19 +138,19 @@ pub const ACTIONS: &[ActionDef] = &[
         label: "Neuer Screenshot (Strg+N)",
         glyph: Glyph::New,
         group: Group::File,
-        shortcut: key(CTRL, Key::N),
+        shortcut: ctrl("n"),
         enabled: always,
-        run: |e, ctx| e.new_capture(ctx),
-        menu: Some(|e, ui| e.capture_menu(ui)),
+        run: |e, window, _| e.new_capture(window),
+        menu: Some(Editor::capture_menu),
     },
     ActionDef {
         id: "oeffnen",
         label: "Bild öffnen … (Strg+O)",
         glyph: Glyph::Open,
         group: Group::File,
-        shortcut: key(CTRL, Key::O),
+        shortcut: ctrl("o"),
         enabled: always,
-        run: |e, _| e.open_dialog(),
+        run: |e, _, _| e.open_dialog(),
         menu: None,
     },
     ActionDef {
@@ -143,9 +158,9 @@ pub const ACTIONS: &[ActionDef] = &[
         label: "Rückgängig (Strg+Z)",
         glyph: Glyph::Undo,
         group: Group::History,
-        shortcut: key(CTRL, Key::Z),
+        shortcut: ctrl("z"),
         enabled: |e| e.history.as_ref().is_some_and(History::can_undo),
-        run: |e, _| e.with_history(History::undo),
+        run: |e, _, _| e.with_history(History::undo),
         menu: None,
     },
     ActionDef {
@@ -153,9 +168,9 @@ pub const ACTIONS: &[ActionDef] = &[
         label: "Wiederholen (Strg+Y)",
         glyph: Glyph::Redo,
         group: Group::History,
-        shortcut: key(CTRL, Key::Y),
+        shortcut: ctrl("y"),
         enabled: |e| e.history.as_ref().is_some_and(History::can_redo),
-        run: |e, _| e.with_history(History::redo),
+        run: |e, _, _| e.with_history(History::redo),
         menu: None,
     },
     ActionDef {
@@ -163,9 +178,9 @@ pub const ACTIONS: &[ActionDef] = &[
         label: "Text erkennen und kopieren (Strg+Umschalt+T)",
         glyph: Glyph::OcrText,
         group: Group::Extra,
-        shortcut: key(CTRL_SHIFT, Key::T),
+        shortcut: ctrl_shift("t"),
         enabled: idle_with_image,
-        run: |e, ctx| e.recognize_text(ctx),
+        run: |e, _, _| e.recognize_text(),
         menu: None,
     },
     ActionDef {
@@ -173,10 +188,10 @@ pub const ACTIONS: &[ActionDef] = &[
         label: "Sensible Daten automatisch unkenntlich machen (Strg+Umschalt+U)",
         glyph: Glyph::AutoRedact,
         group: Group::Extra,
-        shortcut: key(CTRL_SHIFT, Key::U),
+        shortcut: ctrl_shift("u"),
         enabled: idle_with_image,
-        run: |e, ctx| e.auto_redact(ctx),
-        menu: Some(|e, ui| e.redact_menu(ui)),
+        run: |e, _, _| e.auto_redact(),
+        menu: Some(Editor::redact_menu),
     },
     ActionDef {
         id: "anheften",
@@ -185,7 +200,7 @@ pub const ACTIONS: &[ActionDef] = &[
         group: Group::Extra,
         shortcut: None,
         enabled: has_image,
-        run: |e, _| e.pin(),
+        run: |e, _, _| e.pin(),
         menu: None,
     },
     ActionDef {
@@ -193,9 +208,9 @@ pub const ACTIONS: &[ActionDef] = &[
         label: "In die Zwischenablage kopieren (Strg+C)",
         glyph: Glyph::Copy,
         group: Group::Output,
-        shortcut: key(CTRL, Key::C),
+        shortcut: ctrl("c"),
         enabled: has_image,
-        run: |e, _| e.copy(true),
+        run: |e, _, _| e.copy(true),
         menu: None,
     },
     ActionDef {
@@ -203,9 +218,9 @@ pub const ACTIONS: &[ActionDef] = &[
         label: "Speichern unter … (Strg+S)",
         glyph: Glyph::Save,
         group: Group::Output,
-        shortcut: key(CTRL, Key::S),
+        shortcut: ctrl("s"),
         enabled: has_image,
-        run: |e, _| e.save_dialog(),
+        run: |e, _, _| e.save_dialog(),
         menu: None,
     },
 ];
@@ -224,6 +239,8 @@ const PALETTE: [[u8; 3]; 10] = [
     [0xD8, 0x1B, 0x60],
 ];
 
+const CANVAS_BG: Color32 = Color32::from_rgb(0x17, 0x18, 0x1B);
+
 // ---------------------------------------------------------------------------------------------
 
 /// Ergebnisse von Arbeiten im Hintergrund (Texterkennung, Kopieren).
@@ -237,6 +254,14 @@ struct Status {
     text: String,
     error: bool,
     since: Instant,
+}
+
+/// Schieberegler der Optionsleiste, gebunden an ein Werkzeug.
+struct ToolSliders {
+    tool: String,
+    width: Entity<SliderState>,
+    softness: Entity<SliderState>,
+    _subscriptions: [Subscription; 2],
 }
 
 pub struct Editor {
@@ -253,18 +278,27 @@ pub struct Editor {
     view: Option<View>,
     /// Ansicht automatisch einpassen (bis der Benutzer selbst zoomt).
     fit: bool,
-    /// Skalierung im letzten Bild; ändert sie sich (Fenster auf anderen Bildschirm gezogen),
-    /// wird der Zoom so angepasst, dass das Bild in Bildschirmpixeln gleich groß bleibt.
-    last_ppp: f32,
+    /// Lage der Bildfläche im Fenster, beim Layout gemessen.
+    area: Rc<Cell<Rect>>,
+    /// Fläche, für die zuletzt eingepasst wurde.
+    fitted_area: Rect,
+    /// Skalierung des Bildschirms im letzten Bild; ändert sie sich (Fenster auf anderen
+    /// Bildschirm gezogen), wird der Zoom so angepasst, dass das Bild in Bildschirmpixeln
+    /// gleich groß bleibt.
+    last_scale: f32,
     image_size: (u32, u32),
     composite: Option<Canvas>,
     composite_revision: u64,
-    texture: Option<egui::TextureHandle>,
-    preview: Option<(egui::TextureHandle, Rect)>,
+    image: Option<Arc<RenderImage>>,
+    preview: Option<(Arc<RenderImage>, Rect)>,
+    /// Bilder, die die GPU wieder freigeben soll (im nächsten Bild).
+    stale_images: Vec<Arc<RenderImage>>,
     has_transparency: bool,
     gesture: bool,
     last_pointer: Option<Pos2>,
-    panning: bool,
+    /// Verschieben mit mittlerer Maustaste oder Leertaste: letzte Mausposition.
+    panning: Option<Pos2>,
+    space_down: bool,
     busy: Option<&'static str>,
     jobs: Arc<Mutex<Vec<JobResult>>>,
     /// Automatisch kopieren, sobald sich nichts mehr tut.
@@ -273,10 +307,18 @@ pub struct Editor {
     confirm_close: bool,
     allow_close: bool,
     title: String,
+    focus: FocusHandle,
+    /// Textfeld für das Text-Werkzeug und die Stelle, für die es gerade offen ist.
+    text_input: Entity<TextareaState>,
+    text_at: Option<Pos2>,
+    color_picker: Entity<ColorPickerState>,
+    sliders: Option<ToolSliders>,
+    _subscriptions: Vec<Subscription>,
+    _poll: Task<()>,
 }
 
 impl Editor {
-    fn new() -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let prefs = Prefs::load();
         let tools = tools::all();
         let active = tools
@@ -284,6 +326,38 @@ impl Editor {
             .position(|t| t.as_ref().is_some_and(|t| t.id() == prefs.tool))
             .or_else(|| tools.iter().position(Option::is_some))
             .unwrap_or(0);
+
+        let text_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .submit_on_enter(true)
+                .auto_grow(1, 12)
+                .placeholder("Text …")
+        });
+        let color_picker = cx.new(|cx| ColorPickerState::new(window, cx));
+        let subscriptions = vec![
+            // Enter übernimmt den Text (Umschalt+Enter = neue Zeile).
+            cx.subscribe_in(&text_input, window, |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { shift: false, .. } = event {
+                    this.finish_text(true, window, cx);
+                }
+            }),
+            cx.subscribe_in(&color_picker, window, |this, _, event: &ColorPickerEvent, _, cx| {
+                if let ColorPickerEvent::Change(Some(color)) = event {
+                    let rgba = Rgba::from(*color);
+                    let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    this.edit_style(cx, |style| style.color = [to_u8(rgba.r), to_u8(rgba.g), to_u8(rgba.b), 255]);
+                }
+            }),
+        ];
+
+        // Hintergrundarbeiten abholen, automatisch kopieren, Meldungen ausblenden.
+        let poll = cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(100)).await;
+            if this.update_in(cx, |this, _, cx| this.tick(cx)).is_err() {
+                break;
+            }
+        });
+
         Self {
             history: None,
             file: None,
@@ -295,16 +369,20 @@ impl Editor {
             settings: Settings::load(),
             view: None,
             fit: true,
-            last_ppp: 0.0,
+            area: Rc::new(Cell::new(Rect::NOTHING)),
+            fitted_area: Rect::NOTHING,
+            last_scale: 0.0,
             image_size: (0, 0),
             composite: None,
             composite_revision: u64::MAX,
-            texture: None,
+            image: None,
             preview: None,
+            stale_images: Vec::new(),
             has_transparency: false,
             gesture: false,
             last_pointer: None,
-            panning: false,
+            panning: None,
+            space_down: false,
             busy: None,
             jobs: Arc::default(),
             copy_due: None,
@@ -312,6 +390,34 @@ impl Editor {
             confirm_close: false,
             allow_close: false,
             title: String::new(),
+            focus: cx.focus_handle(),
+            text_input,
+            text_at: None,
+            color_picker,
+            sliders: None,
+            _subscriptions: subscriptions,
+            _poll: poll,
+        }
+    }
+
+    /// Läuft alle 100 ms.
+    fn tick(&mut self, cx: &mut Context<Self>) {
+        let mut changed = self.finish_jobs();
+        changed |= self.auto_copy();
+        // Statusmeldungen nach einer Weile ausblenden.
+        if let Some(status) = &self.status {
+            let limit = Duration::from_secs(if status.error { 12 } else { 6 });
+            if status.since.elapsed() >= limit {
+                self.status = None;
+                changed = true;
+            }
+        }
+        if self.prefs_dirty && !self.gesture {
+            self.prefs.save();
+            self.prefs_dirty = false;
+        }
+        if changed || self.busy.is_some() {
+            cx.notify();
         }
     }
 
@@ -389,9 +495,10 @@ impl Editor {
         }
     }
 
+
     // --- Aktionen ----------------------------------------------------------------------------
 
-    fn new_capture(&mut self, ctx: &egui::Context) {
+    fn new_capture(&mut self, window: &mut Window) {
         let delay = self.prefs.delay.to_string();
         self.prefs.save();
         let result = super::spawn(&[CAPTURE_ARG, self.prefs.mode.id(), &delay]);
@@ -399,31 +506,39 @@ impl Editor {
             // Die Aufnahme öffnet einen neuen Editor. Ohne ungesicherte Änderungen wird dieser
             // hier geschlossen, sonst nur aus dem Weg geräumt (nicht mit auf dem Bild).
             if self.dirty() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                window.minimize_window();
             } else {
                 self.allow_close = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                window.remove_window();
             }
         }
         self.report(result);
     }
 
-    fn capture_menu(&mut self, ui: &mut Ui) {
-        ui.label(RichText::new("Aufnahmeart").font(semibold(SMALL_SIZE)).color(TEXT_WEAK));
+    fn capture_menu(&self, mut menu: PopupMenu, editor: WeakEntity<Editor>) -> PopupMenu {
+        menu = menu.label("Aufnahmeart");
         for mode in CaptureMode::ALL {
-            if ui.radio(self.prefs.mode == mode, mode.label()).clicked() {
-                self.prefs.mode = mode;
-                self.prefs_dirty = true;
-            }
+            let editor = editor.clone();
+            menu = menu.item(PopupMenuItem::new(mode.label()).checked(self.prefs.mode == mode).on_click(move |_, _, cx| {
+                let _ = editor.update(cx, |e, cx| {
+                    e.prefs.mode = mode;
+                    e.prefs_dirty = true;
+                    cx.notify();
+                });
+            }));
         }
-        ui.separator();
-        ui.label(RichText::new("Verzögerung").font(semibold(SMALL_SIZE)).color(TEXT_WEAK));
+        menu = menu.separator().label("Verzögerung");
         for (secs, label) in [(0, "Keine"), (3, "3 Sekunden"), (5, "5 Sekunden"), (10, "10 Sekunden")] {
-            if ui.radio(self.prefs.delay == secs, label).clicked() {
-                self.prefs.delay = secs;
-                self.prefs_dirty = true;
-            }
+            let editor = editor.clone();
+            menu = menu.item(PopupMenuItem::new(label).checked(self.prefs.delay == secs).on_click(move |_, _, cx| {
+                let _ = editor.update(cx, |e, cx| {
+                    e.prefs.delay = secs;
+                    e.prefs_dirty = true;
+                    cx.notify();
+                });
+            }));
         }
+        menu
     }
 
     fn composite_image(&mut self) -> Option<image::RgbaImage> {
@@ -478,13 +593,13 @@ impl Editor {
         self.report(result);
     }
 
-    fn recognize_text(&mut self, ctx: &egui::Context) {
+
+    fn recognize_text(&mut self) {
         let Some(image) = self.composite_image() else {
             return;
         };
         self.busy = Some("Text wird erkannt …");
         let jobs = self.jobs.clone();
-        let ctx = ctx.clone();
         thread::spawn(move || {
             let result = crate::ocr::recognize(image.width(), image.height(), image.as_raw())
                 .map_err(|e| format!("Texterkennung: {e}"))
@@ -498,11 +613,10 @@ impl Editor {
                     Ok(text)
                 });
             jobs.lock().unwrap().push(JobResult::Text(result));
-            ctx.request_repaint();
         });
     }
 
-    fn auto_redact(&mut self, ctx: &egui::Context) {
+    fn auto_redact(&mut self) {
         if self.prefs.redact_patterns.is_empty() {
             self.set_status("Im Menü neben dem Knopf mindestens eine Art von Daten auswählen.", true);
             return;
@@ -514,38 +628,36 @@ impl Editor {
         self.busy = Some("Sensible Daten werden gesucht …");
         let enabled = self.prefs.redact_patterns.clone();
         let jobs = self.jobs.clone();
-        let ctx = ctx.clone();
         thread::spawn(move || {
             let result = crate::ocr::recognize_words(image.width(), image.height(), image.as_raw())
                 .map(|lines| redact::find(&lines, &enabled))
                 .map_err(|e| format!("Texterkennung: {e}"));
             jobs.lock().unwrap().push(JobResult::Redact(result));
-            ctx.request_repaint();
         });
     }
 
-    fn redact_menu(&mut self, ui: &mut Ui) {
-        ui.label(RichText::new("Unkenntlich machen").font(semibold(SMALL_SIZE)).color(TEXT_WEAK));
+    fn redact_menu(&self, mut menu: PopupMenu, editor: WeakEntity<Editor>) -> PopupMenu {
+        menu = menu.label("Unkenntlich machen");
         for pattern in PATTERNS {
-            let mut on = self.prefs.redact_patterns.iter().any(|p| p == pattern.id);
-            if ui.checkbox(&mut on, pattern.label).changed() {
-                self.prefs.redact_patterns.retain(|p| p != pattern.id);
-                if on {
-                    self.prefs.redact_patterns.push(pattern.id.to_string());
-                }
-                self.prefs_dirty = true;
-            }
+            let on = self.prefs.redact_patterns.iter().any(|p| p == pattern.id);
+            let editor = editor.clone();
+            menu = menu.item(PopupMenuItem::new(pattern.label).checked(on).on_click(move |_, _, cx| {
+                let _ = editor.update(cx, |e, cx| {
+                    e.prefs.redact_patterns.retain(|p| p != pattern.id);
+                    if !on {
+                        e.prefs.redact_patterns.push(pattern.id.to_string());
+                    }
+                    e.prefs_dirty = true;
+                    cx.notify();
+                });
+            }));
         }
-        ui.separator();
-        ui.label(
-            RichText::new("Art und Stärke wie beim Werkzeug „Unkenntlich machen“.")
-                .font(regular(SMALL_SIZE))
-                .color(TEXT_FAINT),
-        );
+        menu.separator().label("Art und Stärke wie beim Werkzeug „Unkenntlich machen“.")
     }
 
-    fn finish_jobs(&mut self) {
+    fn finish_jobs(&mut self) -> bool {
         let results: Vec<JobResult> = std::mem::take(&mut *self.jobs.lock().unwrap());
+        let changed = !results.is_empty();
         for result in results {
             match result {
                 JobResult::Text(result) => {
@@ -580,6 +692,7 @@ impl Editor {
                 },
             }
         }
+        changed
     }
 
     fn apply_redactions(&mut self, found: Vec<Found>) {
@@ -612,6 +725,7 @@ impl Editor {
         );
     }
 
+
     fn style_of(&self, tool_id: &str) -> Style {
         self.prefs.styles.get(tool_id).copied().unwrap_or_else(|| {
             self.tools
@@ -626,7 +740,7 @@ impl Editor {
     // --- Werkzeuge ---------------------------------------------------------------------------
 
     /// Ruft `f` mit dem aktiven Werkzeug und seinem Kontext auf.
-    fn with_tool<R>(&mut self, f: impl FnOnce(&mut dyn Tool, &mut ToolCtx) -> R) -> Option<R> {
+    fn with_tool<R>(&mut self, shift: bool, f: impl FnOnce(&mut dyn Tool, &mut ToolCtx) -> R) -> Option<R> {
         let view = self.view?;
         let history = self.history.as_mut()?;
         let tool = self.tools.get_mut(self.active)?.as_mut()?;
@@ -635,7 +749,6 @@ impl Editor {
             .styles
             .entry(tool.id().to_string())
             .or_insert_with(|| tool.default_style());
-        let shift = false;
         let mut cx = ToolCtx {
             history,
             style,
@@ -645,21 +758,122 @@ impl Editor {
         Some(f(tool.as_mut(), &mut cx))
     }
 
-    fn select_tool(&mut self, index: usize) {
+    fn select_tool(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index == self.active {
             return;
         }
-        self.with_tool(|tool, cx| tool.deactivate(cx));
+        self.finish_text(true, window, cx);
+        self.with_tool(false, |tool, cx| tool.deactivate(cx));
         self.active = index;
         self.gesture = false;
         if let Some(Some(tool)) = self.tools.get(index) {
             self.prefs.tool = tool.id().to_string();
             self.prefs_dirty = true;
         }
+        cx.notify();
     }
 
     fn active_tool(&self) -> Option<&dyn Tool> {
         self.tools.get(self.active)?.as_deref()
+    }
+
+    /// Stil des aktiven Werkzeugs (gemerkt oder Vorgabe).
+    fn current_style(&self) -> Style {
+        self.active_tool().map(|t| self.style_of(t.id())).unwrap_or_default()
+    }
+
+    /// Stil des aktiven Werkzeugs ändern und merken.
+    fn edit_style(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Style)) {
+        let Some(tool) = self.tools.get(self.active).and_then(|t| t.as_ref()) else {
+            return;
+        };
+        let style = self
+            .prefs
+            .styles
+            .entry(tool.id().to_string())
+            .or_insert_with(|| tool.default_style());
+        let before = *style;
+        change(style);
+        if *style != before {
+            self.prefs_dirty = true;
+            cx.notify();
+        }
+    }
+
+    /// Textfeld des Text-Werkzeugs schließen: übernehmen oder verwerfen.
+    fn finish_text(&mut self, commit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_at.take().is_none() {
+            return;
+        }
+        let text = commit.then(|| self.text_input.read(cx).value().to_string());
+        self.with_tool(false, |tool, tcx| tool.text_done(text, tcx));
+        self.text_input.update(cx, |s, cx| s.set_value("", window, cx));
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Schieberegler für Stärke und Weichheit passend zum aktiven Werkzeug.
+    fn ensure_sliders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tool) = self.active_tool() else {
+            return;
+        };
+        let id = tool.id().to_string();
+        if self.sliders.as_ref().is_some_and(|s| s.tool == id) {
+            return;
+        }
+        let (min, max) = tool
+            .options()
+            .iter()
+            .find_map(|o| match o {
+                Opt::Width { min, max, .. } => Some((*min, *max)),
+                _ => None,
+            })
+            .unwrap_or((1.0, 30.0));
+        let style = self.style_of(&id);
+        let width = cx.new(|_| {
+            SliderState::new()
+                .min(min)
+                .max(max)
+                .step(1.0)
+                .default_value(style.width.clamp(min, max))
+        });
+        let softness = cx.new(|_| {
+            SliderState::new()
+                .min(2.0)
+                .max(80.0)
+                .step(1.0)
+                .default_value(style.softness.clamp(2.0, 80.0))
+        });
+        let subscriptions = [
+            cx.subscribe_in(&width, window, |this, _, event: &SliderEvent, _, cx| {
+                if let SliderEvent::Change(v) = event {
+                    let v = v.end().round();
+                    this.edit_style(cx, |s| s.width = v);
+                }
+            }),
+            cx.subscribe_in(&softness, window, |this, _, event: &SliderEvent, _, cx| {
+                if let SliderEvent::Change(v) = event {
+                    let v = v.end().round();
+                    this.edit_style(cx, |s| s.softness = v);
+                }
+            }),
+        ];
+        // Farbwähler zeigt die Farbe des Werkzeugs.
+        let [r, g, b, _] = style.color;
+        let color: Hsla = Rgba {
+            r: r as f32 / 255.0,
+            g: g as f32 / 255.0,
+            b: b as f32 / 255.0,
+            a: 1.0,
+        }
+        .into();
+        self.color_picker.update(cx, |s, cx| s.set_value(color, window, cx));
+        self.sliders = Some(ToolSliders {
+            tool: id,
+            width,
+            softness,
+            _subscriptions: subscriptions,
+        });
     }
 
     // --- Rendern -----------------------------------------------------------------------------
@@ -672,14 +886,18 @@ impl Editor {
         if self.composite_revision != history.revision() || self.composite.is_none() {
             self.composite = Some(history.doc.compose());
             self.composite_revision = history.revision();
-            self.texture = None;
+            if let Some(old) = self.image.take() {
+                self.stale_images.push(old);
+            }
         }
     }
 
-    fn update_textures(&mut self, ctx: &egui::Context) {
+    fn update_images(&mut self) {
         self.ensure_composite();
         let Some(composite) = &self.composite else {
-            self.texture = None;
+            if let Some(old) = self.image.take() {
+                self.stale_images.push(old);
+            }
             return;
         };
         let size = (composite.pixmap.width(), composite.pixmap.height());
@@ -688,13 +906,15 @@ impl Editor {
             self.fit = true;
             self.view = None;
         }
-        if self.texture.is_none() {
+        if self.image.is_none() {
             self.has_transparency = composite.pixmap.pixels().iter().any(|p| p.alpha() < 255);
-            self.texture = Some(canvas_texture(ctx, "bild", composite));
+            self.image = Some(canvas_image(composite));
         }
 
         // Live-Vorschau: nur der Bereich der entstehenden Anmerkung wird neu gerendert.
-        self.preview = None;
+        if let Some((old, _)) = self.preview.take() {
+            self.stale_images.push(old);
+        }
         let Some(item) = self.tools.get(self.active).and_then(|t| t.as_ref()).and_then(|t| t.preview()) else {
             return;
         };
@@ -706,7 +926,7 @@ impl Editor {
                 doc.items.push(item.box_clone());
                 let canvas = doc.compose();
                 let area = canvas.area().to_rect();
-                self.preview = Some((canvas_texture(ctx, "vorschau", &canvas), area));
+                self.preview = Some((canvas_image(&canvas), area));
             }
             return;
         }
@@ -718,547 +938,321 @@ impl Editor {
         if let Some(mut canvas) = composite.crop(region) {
             item.render(&mut canvas);
             let area = canvas.area().to_rect();
-            self.preview = Some((canvas_texture(ctx, "vorschau", &canvas), area));
+            self.preview = Some((canvas_image(&canvas), area));
         }
     }
 
-    // --- Oberfläche --------------------------------------------------------------------------
-
-    fn toolbar(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            self.action_group(ui, ctx, Group::File);
-            divider(ui);
-            for index in 0..self.tools.len() {
-                let Some(tool) = &self.tools[index] else {
-                    divider(ui);
-                    continue;
-                };
-                let tooltip = match tool.shortcut() {
-                    Some(key) => format!("{} ({})", tool.label(), key.name()),
-                    None => tool.label().to_string(),
-                };
-                let enabled = self.history.is_some();
-                if icons::button(ui, tool.glyph(), index == self.active && enabled, enabled, &tooltip).clicked() {
-                    self.select_tool(index);
-                }
+    /// Ansicht einpassen bzw. an eine neue Bildschirmskalierung anpassen.
+    fn update_view(&mut self, window: &Window) {
+        let area = self.area.get();
+        let scale_factor = window.scale_factor();
+        if self.last_scale > 0.0 && (scale_factor - self.last_scale).abs() > 0.001 {
+            if let Some(view) = &mut self.view {
+                let ratio = self.last_scale / scale_factor;
+                let anchor = area.min;
+                view.scale *= ratio;
+                view.offset = anchor + (view.offset - anchor) * ratio;
             }
-            divider(ui);
-            self.action_group(ui, ctx, Group::History);
-            divider(ui);
-            self.action_group(ui, ctx, Group::Extra);
-
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                // Rechts nach links: Speichern ganz außen.
-                let output: Vec<&ActionDef> = ACTIONS.iter().filter(|a| a.group == Group::Output).collect();
-                for action in output.iter().rev() {
-                    self.action_button(ui, ctx, action);
-                }
-            });
-        });
-    }
-
-    fn action_group(&mut self, ui: &mut Ui, ctx: &egui::Context, group: Group) {
-        for action in ACTIONS.iter().filter(|a| a.group == group) {
-            self.action_button(ui, ctx, action);
         }
-    }
-
-    fn action_button(&mut self, ui: &mut Ui, ctx: &egui::Context, action: &ActionDef) {
-        let enabled = (action.enabled)(self);
-        if icons::button(ui, action.glyph, false, enabled, action.label).clicked() {
-            (action.run)(self, ctx);
-        }
-        if let Some(menu) = action.menu {
-            let response = ui.add(
-                egui::Button::new(RichText::new("▾").font(regular(SMALL_SIZE)).color(TEXT_WEAK))
-                    .frame(false)
-                    .min_size(vec2(12.0, 30.0)),
-            );
-            egui::Popup::menu(&response).show(|ui| {
-                ui.set_min_width(200.0);
-                menu(self, ui);
-            });
-        }
-    }
-
-    fn options_bar(&mut self, ui: &mut Ui) {
-        let Some(tool) = self.tools.get(self.active).and_then(|t| t.as_ref()) else {
+        self.last_scale = scale_factor;
+        if !area.is_positive() || self.history.is_none() {
             return;
-        };
-        let options = tool.options();
-        let hint = tool.hint();
-        let id = tool.id().to_string();
-        let default = tool.default_style();
-        let enabled = self.history.is_some();
-        let style = self.prefs.styles.entry(id).or_insert(default);
-        let before = *style;
-        ui.horizontal(|ui| {
-            ui.set_min_height(30.0);
-            ui.add_enabled_ui(enabled, |ui| {
-                for option in options {
-                    match *option {
-                        Opt::Color => {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            for rgb in PALETTE {
-                                let color = [rgb[0], rgb[1], rgb[2], 255];
-                                if swatch(ui, color, style.color == color).clicked() {
-                                    style.color = color;
-                                }
-                            }
-                            let mut custom = style.color();
-                            if egui::color_picker::color_edit_button_srgba(ui, &mut custom, egui::color_picker::Alpha::Opaque)
-                                .on_hover_text("Eigene Farbe")
-                                .changed()
-                            {
-                                style.color = custom.to_srgba_unmultiplied();
-                            }
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            ui.add_space(10.0);
-                        }
-                        Opt::Width { label, min, max } => {
-                            ui.label(RichText::new(label).color(TEXT_WEAK));
-                            ui.add(egui::Slider::new(&mut style.width, min..=max).integer().trailing_fill(true));
-                            ui.add_space(10.0);
-                        }
-                        Opt::Filled(label) => {
-                            ui.label(RichText::new(label).color(TEXT_WEAK));
-                            ui_kit::toggle(ui, &mut style.filled);
-                            ui.add_space(10.0);
-                        }
-                        Opt::Redact => {
-                            for mode in RedactMode::ALL {
-                                if ui.selectable_label(style.redact == mode, mode.label()).clicked() {
-                                    style.redact = mode;
-                                }
-                            }
-                            ui.add_space(10.0);
-                        }
-                        Opt::SoftEdge => {
-                            if style.redact != RedactMode::Blur {
-                                continue;
-                            }
-                            let text = if style.soft_edge {
-                                format!("Weicher Rand: {} px ▾", style.softness.round())
-                            } else {
-                                "Harter Rand ▾".to_string()
-                            };
-                            let response = ui
-                                .button(text)
-                                .on_hover_text("Runde Ecken und ein nach außen auslaufender Rand");
-                            egui::Popup::menu(&response)
-                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                                .show(|ui| {
-                                    ui.set_min_width(220.0);
-                                    ui.horizontal(|ui| {
-                                        ui.label("Weicher Rand");
-                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                            ui_kit::toggle(ui, &mut style.soft_edge);
-                                        });
-                                    });
-                                    ui.add_enabled_ui(style.soft_edge, |ui| {
-                                        ui.label(RichText::new("Weichheit").color(TEXT_WEAK));
-                                        ui.add(
-                                            egui::Slider::new(&mut style.softness, 2.0..=80.0)
-                                                .integer()
-                                                .suffix(" px")
-                                                .trailing_fill(true),
-                                        );
-                                    });
-                                });
-                            ui.add_space(10.0);
-                        }
-                    }
-                }
+        }
+        let (w, h) = self.image_size;
+        let size = vec2(w as f32, h as f32);
+        if self.view.is_none() || (self.fit && area != self.fitted_area) {
+            let scale = (1.0 / scale_factor)
+                .min((area.width() - 48.0) / size.x)
+                .min((area.height() - 48.0) / size.y)
+                .max(0.02);
+            self.view = Some(View {
+                offset: area.center() - size * scale / 2.0,
+                scale,
             });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add(egui::Label::new(RichText::new(hint).font(regular(SMALL_SIZE)).color(TEXT_FAINT)).truncate());
-            });
-        });
-        if *style != before {
-            self.prefs_dirty = true;
+            self.fitted_area = area;
         }
     }
 
-    fn status_bar(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.set_min_height(24.0);
-            if let Some(busy) = self.busy {
-                ui.add(egui::Spinner::new().size(14.0).color(ui_kit::ACCENT));
-                ui.label(RichText::new(busy).font(regular(SMALL_SIZE)).color(TEXT_WEAK));
-            } else if let Some(status) = &self.status {
-                let color = if status.error { ui_kit::RED } else { ui_kit::GREEN };
-                ui.label(RichText::new("●").font(regular(SMALL_SIZE)).color(color));
-                ui.add(egui::Label::new(RichText::new(&status.text).font(regular(SMALL_SIZE)).color(TEXT_WEAK)).truncate());
-            } else if let Some(file) = &self.file {
-                ui.label(RichText::new(file.display().to_string()).font(regular(SMALL_SIZE)).color(TEXT_FAINT));
-            }
-
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let Some(view) = self.view else {
-                    return;
-                };
-                if ui.small_button("Einpassen").on_hover_text("Strg+0").clicked() {
-                    self.fit = true;
-                    self.view = None;
-                }
-                let ppp = ui.ctx().pixels_per_point();
-                if ui.small_button("100 %").on_hover_text("Strg+1").clicked() {
-                    self.zoom_to(1.0 / ppp, None, ui.ctx());
-                }
-                ui.label(
-                    RichText::new(format!("{:.0} %", view.scale * ppp * 100.0))
-                        .font(regular(SMALL_SIZE))
-                        .color(TEXT_WEAK),
-                );
-                let (w, h) = self.image_size;
-                ui.label(RichText::new(format!("{w} × {h} px")).font(regular(SMALL_SIZE)).color(TEXT_FAINT));
-            });
-        });
-    }
-
-    fn zoom_to(&mut self, scale: f32, anchor: Option<Pos2>, ctx: &egui::Context) {
+    fn zoom_to(&mut self, scale: f32, anchor: Option<Pos2>) {
         let Some(view) = &mut self.view else {
             return;
         };
         let scale = scale.clamp(0.02, 32.0);
-        let anchor = anchor.unwrap_or_else(|| ctx.content_rect().center());
+        let anchor = anchor.unwrap_or_else(|| self.area.get().center());
         let image_point = view.to_image(anchor);
         view.scale = scale;
         view.offset = anchor - image_point.to_vec2() * scale;
         self.fit = false;
     }
 
-    fn empty_state(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        let rect = ui.max_rect();
-        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
-        let card = Rect::from_center_size(rect.center(), vec2(420.0, 250.0));
-        ui.painter().rect(
-            card,
-            CornerRadius::same(14),
-            ui_kit::GROUP_BG,
-            Stroke::new(if hovering { 2.0 } else { 1.0 }, if hovering { ui_kit::ACCENT } else { ui_kit::DIVIDER }),
-            StrokeKind::Inside,
-        );
-        ui.scope_builder(egui::UiBuilder::new().max_rect(card.shrink(24.0)), |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(8.0);
-                ui.label(RichText::new("Screenshot aufnehmen oder Bild öffnen").font(semibold(17.0)).color(TEXT));
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Oder ein Bild hierher ziehen bzw. mit Strg+V einfügen.")
-                        .font(regular(BODY_SIZE))
-                        .color(TEXT_WEAK),
-                );
-                ui.add_space(22.0);
-                if ui.add(ui_kit::primary_button("Neuer Screenshot").min_size(vec2(220.0, 34.0))).clicked() {
-                    self.new_capture(ctx);
-                }
-                ui.add_space(6.0);
-                if ui.add(egui::Button::new("Bild öffnen …").min_size(vec2(220.0, 30.0))).clicked() {
-                    self.open_dialog();
-                }
-                ui.add_space(6.0);
-                if ui.add(egui::Button::new("Aus Zwischenablage einfügen").min_size(vec2(220.0, 30.0))).clicked() {
-                    self.paste();
-                }
-            });
+    fn fit_view(&mut self) {
+        self.fit = true;
+        self.view = None;
+    }
+
+    /// Zeichnet Bild, Vorschau und Werkzeug-Hilfslinien (Zeichenphase der Bildfläche).
+    fn paint_canvas(&self, window: &mut Window) {
+        let area = self.area.get();
+        let Some(view) = self.view else {
+            return;
+        };
+        let (w, h) = self.image_size;
+        let image_rect = view.rect_to_screen(Rect::from_min_size(Pos2::ZERO, vec2(w as f32, h as f32)));
+        window.with_content_mask(Some(ContentMask { bounds: ui_kit::to_bounds(area) }), |window| {
+            let mut p = Painter::new(window);
+            // Schatten und Karo-Muster für durchsichtige Bereiche.
+            p.rect_filled(image_rect.translate(vec2(0.0, 3.0)).expand(2.0), 3.0, Color32::from_black_alpha(60));
+            if self.has_transparency {
+                checkerboard(&mut p, image_rect.intersect(area));
+            }
+            if let Some(image) = &self.image {
+                p.image(area, image_rect, image);
+            }
+            if let Some((image, region)) = &self.preview {
+                p.image(area, view.rect_to_screen(*region), image);
+            }
+            if let (Some(tool), Some(history)) = (self.active_tool(), &self.history) {
+                tool.paint_overlay(&mut p, view, &history.doc);
+            }
         });
     }
 
-    fn canvas(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        let area = ui.max_rect();
-        let ppp = ctx.pixels_per_point();
-        if self.last_ppp > 0.0 && (ppp - self.last_ppp).abs() > 0.001 {
-            if let Some(view) = &mut self.view {
-                let ratio = self.last_ppp / ppp;
-                view.scale *= ratio;
-                view.offset = (view.offset.to_vec2() * ratio).to_pos2();
-            }
+    // --- Eingabe -----------------------------------------------------------------------------
+
+    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let p = ui_kit::from_point(event.position);
+        window.focus(&self.focus, cx);
+        if event.button == MouseButton::Middle || (event.button == MouseButton::Left && self.space_down) {
+            self.panning = Some(p);
+            return;
         }
-        self.last_ppp = ppp;
-        let (w, h) = self.image_size;
-        let size = vec2(w as f32, h as f32);
-        if self.fit || self.view.is_none() {
-            let scale = (1.0 / ppp).min((area.width() - 48.0) / size.x).min((area.height() - 48.0) / size.y).max(0.02);
-            self.view = Some(View {
-                offset: area.center() - size * scale / 2.0,
-                scale,
-            });
+        if event.button != MouseButton::Left || self.history.is_none() {
+            return;
+        }
+        // Klick neben das Textfeld übernimmt den Text (und setzt kein neues).
+        if self.text_at.is_some() {
+            self.finish_text(true, window, cx);
+            return;
         }
         let Some(view) = self.view else {
             return;
         };
-
-        let response = ui.interact(area, egui::Id::unique("leinwand"), Sense::click_and_drag());
-        let painter = ui.painter_at(area);
-        let image_rect = view.rect_to_screen(Rect::from_min_size(Pos2::ZERO, size));
-
-        // Schatten und Karo-Muster für durchsichtige Bereiche.
-        painter.rect_filled(image_rect.translate(vec2(0.0, 3.0)).expand(2.0), CornerRadius::same(3), Color32::from_black_alpha(60));
-        if self.has_transparency {
-            checkerboard(&painter, image_rect.intersect(area));
-        }
-        let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
-        if let Some(texture) = &self.texture {
-            painter.image(texture.id(), image_rect, uv, Color32::WHITE);
-        }
-        if let Some((texture, region)) = &self.preview {
-            painter.image(texture.id(), view.rect_to_screen(*region), uv, Color32::WHITE);
-        }
-
-        // --- Eingabe ---
-        let no_focus = ctx.memory(|m| m.focused().is_none());
-        let (pressed, down, released, pointer, shift, middle, delta) = ctx.input(|i| {
-            (
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.primary_released(),
-                i.pointer.interact_pos(),
-                i.modifiers.shift,
-                i.pointer.middle_down(),
-                i.pointer.delta(),
-            )
-        });
-        let space = no_focus && ctx.input(|i| i.key_down(Key::Space));
-
-        // Verschieben: mittlere Maustaste oder Leertaste + Ziehen.
-        if (middle || (space && down)) && (response.hovered() || self.panning) {
-            self.panning = true;
-            if let Some(view) = &mut self.view {
-                view.offset += delta;
-            }
-            self.fit = false;
-            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-        } else {
-            self.panning = false;
-            let to_image = |p: Pos2| view.to_image(p);
-            let mut event = None;
-            if pressed && response.hovered() {
-                if let Some(p) = pointer {
-                    self.gesture = true;
-                    self.last_pointer = Some(p);
-                    event = Some(Input::Press(to_image(p)));
-                }
-            } else if self.gesture && released {
-                self.gesture = false;
-                let p = pointer.or(self.last_pointer).unwrap_or_default();
-                event = Some(Input::Release(to_image(p)));
-            } else if self.gesture && down {
-                if let Some(p) = pointer.filter(|p| Some(*p) != self.last_pointer) {
-                    self.last_pointer = Some(p);
-                    event = Some(Input::Drag(to_image(p)));
-                }
-            }
-            if let Some(event) = event {
-                self.with_tool(|tool, cx| {
-                    cx.shift = shift;
-                    tool.pointer(event, cx);
-                });
-            }
-            if response.hovered() {
-                if space {
-                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
-                } else if let Some(tool) = self.active_tool() {
-                    ctx.set_cursor_icon(tool.cursor());
-                }
-            }
-        }
-
-        // Zoomen mit Strg+Mausrad (bzw. Touchpad-Geste), sonst scrollen.
-        if response.hovered() {
-            let (zoom, scroll) = ctx.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));
-            if zoom != 1.0 {
-                self.zoom_to(view.scale * zoom, pointer, ctx);
-            } else if scroll != egui::Vec2::ZERO {
-                if let Some(view) = &mut self.view {
-                    view.offset += scroll;
-                }
-                self.fit = false;
-            }
-        }
-
-        // Werkzeug-eigene Oberfläche (Textfeld, Zuschneiderahmen, Auswahl).
-        self.with_tool(|tool, cx| tool.overlay(ui, cx));
+        self.gesture = true;
+        self.last_pointer = Some(p);
+        let shift = event.modifiers.shift;
+        self.with_tool(shift, |tool, tcx| tool.pointer(Input::Press(view.to_image(p)), tcx));
+        self.after_tool_input(window, cx);
     }
 
-    fn shortcuts(&mut self, ctx: &egui::Context) {
-        let no_focus = ctx.memory(|m| m.focused().is_none());
-        let typing = self.active_tool().is_some_and(|t| t.typing());
-
-        // Zuerst darf das Werkzeug Tasten nutzen (Entf, Enter, Esc).
-        for key in [Key::Delete, Key::Backspace, Key::Enter, Key::Escape] {
-            if no_focus && ctx.input(|i| i.key_pressed(key) && i.modifiers.is_none()) {
-                let used = self.with_tool(|tool, cx| tool.key(key, cx)).unwrap_or(false);
-                if used {
-                    ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key));
-                }
+    fn mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let p = ui_kit::from_point(event.position);
+        if let Some(last) = self.panning {
+            if let Some(view) = &mut self.view {
+                view.offset += p - last;
             }
+            self.panning = Some(p);
+            self.fit = false;
+            cx.notify();
+            return;
         }
-        if !no_focus || typing {
+        if !self.gesture || Some(p) == self.last_pointer {
+            return;
+        }
+        let Some(view) = self.view else {
+            return;
+        };
+        self.last_pointer = Some(p);
+        let shift = event.modifiers.shift;
+        self.with_tool(shift, |tool, tcx| tool.pointer(Input::Drag(view.to_image(p)), tcx));
+        self.after_tool_input(window, cx);
+    }
+
+    fn mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panning.take().is_some() {
+            return;
+        }
+        if !self.gesture || event.button != MouseButton::Left {
+            return;
+        }
+        self.gesture = false;
+        let Some(view) = self.view else {
+            return;
+        };
+        let p = ui_kit::from_point(event.position);
+        let shift = event.modifiers.shift;
+        self.with_tool(shift, |tool, tcx| tool.pointer(Input::Release(view.to_image(p)), tcx));
+        self.after_tool_input(window, cx);
+    }
+
+    /// Nach einer Eingabe: ggf. das Textfeld des Text-Werkzeugs öffnen.
+    fn after_tool_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entry = self.active_tool().and_then(|t| t.text_entry());
+        if entry.is_some() && self.text_at.is_none() {
+            self.text_at = entry;
+            self.text_input.update(cx, |s, cx| {
+                s.set_value("", window, cx);
+                s.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
+        let delta = ui_kit::from_point(event.delta.pixel_delta(px(20.0))).to_vec2();
+        if event.modifiers.control {
+            // Zoomen mit Strg+Mausrad.
+            if let Some(view) = self.view {
+                let factor = (1.0 + delta.y * 0.0025).clamp(0.5, 2.0);
+                self.zoom_to(view.scale * factor, Some(ui_kit::from_point(event.position)));
+            }
+        } else if let Some(view) = &mut self.view {
+            view.offset += delta;
+            self.fit = false;
+        }
+        cx.notify();
+    }
+
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let m = event.keystroke.modifiers;
+        if window.focused_input(cx).is_some() {
+            return;
+        }
+        if key == "space" && !m.modified() {
+            self.space_down = true;
             return;
         }
 
-        // Aktionen; Varianten mit Umschalt zuerst, damit Strg+S nicht Strg+Umschalt+S schluckt.
-        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(CTRL_SHIFT, Key::Z))) {
-            self.with_history(History::redo);
-        }
-        let mut ordered: Vec<&ActionDef> = ACTIONS.iter().collect();
-        ordered.sort_by_key(|a| !a.shortcut.is_some_and(|s| s.modifiers.shift));
-        for action in ordered {
-            if let Some(shortcut) = action.shortcut {
-                if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) && (action.enabled)(self) {
-                    (action.run)(self, ctx);
-                }
+        // Zuerst darf das Werkzeug Tasten nutzen (Entf, Enter, Esc).
+        if !m.modified() && matches!(key, "delete" | "backspace" | "enter" | "escape") {
+            let used = self.with_tool(false, |tool, tcx| tool.key(key, tcx)).unwrap_or(false);
+            if used {
+                cx.stop_propagation();
+                cx.notify();
+                return;
             }
         }
-        // Strg+C und Strg+V kommen von egui als eigene Ereignisse, nicht als Tasten.
-        let (copy, paste) = ctx.input(|i| {
-            (
-                i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
-                i.events.iter().any(|e| matches!(e, egui::Event::Paste(_) | egui::Event::PasteImage(_))),
-            )
-        });
-        if copy {
-            self.run_action("kopieren", ctx);
+        if self.active_tool().is_some_and(|t| t.typing()) {
+            return;
         }
-        if paste {
-            self.paste();
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(CTRL, Key::Num0))) {
-            self.fit = true;
-            self.view = None;
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(CTRL, Key::Num1))) {
-            self.zoom_to(1.0 / ctx.pixels_per_point(), None, ctx);
-        }
-        for (shortcut, factor) in [
-            (KeyboardShortcut::new(CTRL, Key::Plus), 1.25),
-            (KeyboardShortcut::new(CTRL, Key::Equals), 1.25),
-            (KeyboardShortcut::new(CTRL, Key::Minus), 0.8),
-        ] {
-            if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+
+        if m.control && !m.alt {
+            if m.shift && key == "z" {
+                self.with_history(History::redo);
+            } else if let Some(action) = ACTIONS
+                .iter()
+                .find(|a| a.shortcut.is_some_and(|s| s.shift == m.shift && s.key == key))
+            {
+                if (action.enabled)(self) {
+                    (action.run)(self, window, cx);
+                }
+            } else if !m.shift && key == "v" {
+                self.paste();
+            } else if key == "0" {
+                self.fit_view();
+            } else if key == "1" {
+                self.zoom_to(1.0 / window.scale_factor(), None);
+            } else if matches!(key, "+" | "=") {
                 if let Some(view) = self.view {
-                    self.zoom_to(view.scale * factor, None, ctx);
+                    self.zoom_to(view.scale * 1.25, None);
                 }
+            } else if key == "-" {
+                if let Some(view) = self.view {
+                    self.zoom_to(view.scale * 0.8, None);
+                }
+            } else {
+                return;
             }
+            cx.stop_propagation();
+            cx.notify();
+            return;
         }
 
         // Werkzeuge mit einzelnen Buchstaben.
-        if self.history.is_some() {
-            let pressed = ctx.input(|i| {
-                if !i.modifiers.is_none() {
-                    return None;
-                }
-                self.tools
-                    .iter()
-                    .position(|t| t.as_ref().and_then(|t| t.shortcut()).is_some_and(|k| i.key_pressed(k)))
-            });
-            if let Some(index) = pressed {
-                self.select_tool(index);
+        if !m.modified() && self.history.is_some() {
+            let index = self
+                .tools
+                .iter()
+                .position(|t| t.as_ref().and_then(|t| t.shortcut()) == Some(key));
+            if let Some(index) = index {
+                self.select_tool(index, window, cx);
             }
         }
     }
 
-    fn run_action(&mut self, id: &str, ctx: &egui::Context) {
+    fn key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+        if event.keystroke.key == "space" {
+            self.space_down = false;
+            cx.notify();
+        }
+    }
+
+    fn run_action(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(action) = ACTIONS.iter().find(|a| a.id == id) {
             if (action.enabled)(self) {
-                (action.run)(self, ctx);
+                (action.run)(self, window, cx);
             }
         }
+        cx.notify();
     }
 
-    fn handle_drops(&mut self, ctx: &egui::Context) {
-        let dropped: Option<PathBuf> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .map(|f| f.path().to_path_buf())
-                .find(|p| p.is_file())
-        });
-        if let Some(path) = dropped {
-            self.open(&path);
+    // --- Schließen ---------------------------------------------------------------------------
+
+    /// Darf das Fenster zu? Bei ungesicherten Änderungen erst nachfragen.
+    fn should_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.allow_close || !self.dirty() {
+            self.prefs.save();
+            return true;
         }
+        self.confirm_close = true;
+        cx.notify();
+        false
     }
 
-    fn close_dialog(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.dirty() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.confirm_close = true;
-        }
-        if !self.confirm_close {
-            return;
-        }
-        let mut choice = None;
-        egui::Modal::new(egui::Id::unique("schliessen")).show(ctx, |ui| {
-            ui.set_width(340.0);
-            ui.label(RichText::new("Änderungen speichern?").font(semibold(16.0)).color(TEXT));
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("Das bearbeitete Bild wurde noch nicht gespeichert oder kopiert.")
-                    .color(TEXT_WEAK),
-            );
-            ui.add_space(14.0);
-            ui.horizontal(|ui| {
-                if ui.add(ui_kit::primary_button("Speichern …")).clicked() {
-                    choice = Some(0);
-                }
-                if ui.button("Nicht speichern").clicked() {
-                    choice = Some(1);
-                }
-                if ui.button("Abbrechen").clicked() {
-                    choice = Some(2);
-                }
-            });
-        });
+    fn close_choice(&mut self, choice: u8, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_close = false;
         match choice {
-            Some(0) => {
-                self.confirm_close = false;
+            0 => {
                 self.save_dialog();
                 if !self.dirty() {
                     self.allow_close = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.prefs.save();
+                    window.remove_window();
                 }
             }
-            Some(1) => {
-                self.confirm_close = false;
+            1 => {
                 self.allow_close = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.prefs.save();
+                window.remove_window();
             }
-            Some(_) => self.confirm_close = false,
-            None => {}
+            _ => {}
         }
+        cx.notify();
     }
 
-    fn auto_copy(&mut self, ctx: &egui::Context) {
+    fn auto_copy(&mut self) -> bool {
         // Wie im Snipping Tool: Änderungen landen von selbst in der Zwischenablage.
         if !self.settings.snip_copy || self.history.is_none() || self.gesture {
             self.copy_due = None;
-            return;
+            return false;
         }
         let revision = self.revision();
         if revision == self.exported_revision || revision == 0 {
-            return;
+            return false;
         }
         match self.copy_due {
             Some((r, due)) if r == revision => {
                 if Instant::now() >= due {
                     self.copy_due = None;
                     self.copy(false);
-                } else {
-                    ctx.request_repaint_after(due - Instant::now());
                 }
             }
-            _ => {
-                let due = Instant::now() + Duration::from_millis(600);
-                self.copy_due = Some((revision, due));
-                ctx.request_repaint_after(Duration::from_millis(600));
-            }
+            _ => self.copy_due = Some((revision, Instant::now() + Duration::from_millis(600))),
         }
+        false
     }
 
-    fn update_title(&mut self, ctx: &egui::Context) {
+    fn update_title(&mut self, window: &mut Window) {
         let name = match (&self.file, &self.history) {
             (Some(file), _) => file_name(file),
             (None, Some(_)) => "Screenshot".into(),
@@ -1266,110 +1260,550 @@ impl Editor {
         };
         let title = format!("{}{name} – UtilityCrab", if self.dirty() { "• " } else { "" });
         if title != self.title {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            window.set_window_title(&title);
             self.title = title;
         }
     }
 }
 
-impl eframe::App for Editor {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.finish_jobs();
-        self.handle_drops(&ctx);
-        self.shortcuts(&ctx);
-        self.update_textures(&ctx);
-
-        let bar = egui::Frame::new()
-            .fill(ui_kit::SIDEBAR_BG)
-            .inner_margin(egui::Margin::symmetric(10, 6));
-        egui::Panel::top("werkzeuge").frame(bar).show(ui, |ui| self.toolbar(ui, &ctx));
-        let options = egui::Frame::new()
-            .fill(ui_kit::CONTENT_BG)
-            .inner_margin(egui::Margin::symmetric(14, 4));
-        egui::Panel::top("optionen").frame(options).show(ui, |ui| self.options_bar(ui));
-        let status = egui::Frame::new()
-            .fill(ui_kit::SIDEBAR_BG)
-            .inner_margin(egui::Margin::symmetric(12, 3));
-        egui::Panel::bottom("status").frame(status).show(ui, |ui| self.status_bar(ui));
-
-        let canvas_bg = egui::Frame::new().fill(Color32::from_rgb(0x17, 0x18, 0x1B));
-        egui::CentralPanel::default().frame(canvas_bg).show(ui, |ui| {
-            if self.history.is_some() {
-                self.canvas(ui, &ctx);
-            } else {
-                self.empty_state(ui, &ctx);
-            }
-        });
-
-        self.auto_copy(&ctx);
-        self.close_dialog(&ctx);
-        self.update_title(&ctx);
-        if self.prefs_dirty && !self.gesture {
-            self.prefs.save();
-            self.prefs_dirty = false;
+impl Render for Editor {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for image in self.stale_images.drain(..) {
+            ui_kit::drop_image(image, window);
         }
-        // Statusmeldungen nach einer Weile ausblenden.
-        if let Some(status) = &self.status {
-            let shown = status.since.elapsed();
-            let limit = Duration::from_secs(if status.error { 12 } else { 6 });
-            if shown >= limit {
-                self.status = None;
-            } else {
-                ctx.request_repaint_after(limit - shown);
-            }
-        }
-        if self.busy.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
+        self.update_images();
+        self.update_view(window);
+        self.ensure_sliders(window, cx);
+        self.update_title(window);
+
+        let body: AnyElement = if self.history.is_some() {
+            self.canvas_area(cx).into_any_element()
+        } else {
+            self.empty_state(cx).into_any_element()
+        };
+
+        v_flex()
+            .id("editor")
+            .size_full()
+            .bg(CANVAS_BG)
+            .font_family(ui_kit::FONT)
+            .text_size(px(BODY_SIZE))
+            .text_color(TEXT)
+            .track_focus(&self.focus)
+            // Esc im Textfeld verwirft den Text, bevor das Feld die Taste bekommt.
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.text_at.is_some() && event.keystroke.key == "escape" {
+                    this.finish_text(false, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| this.key_down(event, window, cx)))
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, cx| this.key_up(event, cx)))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                if let Some(path) = paths.paths().iter().find(|p| p.is_file()) {
+                    this.open(&path.clone());
+                    cx.notify();
+                }
+            }))
+            .child(self.toolbar(cx))
+            .child(self.options_bar(cx))
+            .child(body)
+            .child(self.status_bar(cx))
+            .when(self.confirm_close, |el| el.child(self.close_dialog(cx)))
+    }
+}
+
+impl Editor {
+    fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let enabled = self.history.is_some();
+        let tools: Vec<AnyElement> = self.tools.iter().enumerate().map(|(index, tool)| -> AnyElement {
+            let Some(tool) = tool else {
+                return vertical_divider().into_any_element();
+            };
+            let tooltip = match tool.shortcut() {
+                Some(key) => format!("{} ({})", tool.label(), key.to_uppercase()),
+                None => tool.label().to_string(),
+            };
+            icons::button(("werkzeug", index), tool.glyph(), index == self.active && enabled, enabled, tooltip)
+                .when(enabled, |el| {
+                    el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.select_tool(index, window, cx)))
+                })
+                .into_any_element()
+        }).collect();
+        h_flex()
+            .w_full()
+            .flex_none()
+            .bg(ui_kit::SIDEBAR_BG)
+            .px(px(10.0))
+            .py(px(6.0))
+            .gap(px(2.0))
+            .children(self.action_group(Group::File, cx))
+            .child(vertical_divider())
+            .children(tools)
+            .child(vertical_divider())
+            .children(self.action_group(Group::History, cx))
+            .child(vertical_divider())
+            .children(self.action_group(Group::Extra, cx))
+            .child(div().flex_1())
+            .children(self.action_group(Group::Output, cx))
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.prefs.save();
+    fn action_group(&self, group: Group, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out = Vec::new();
+        for action in ACTIONS.iter().filter(|a| a.group == group) {
+            let enabled = (action.enabled)(self);
+            let id = action.id;
+            out.push(
+                icons::button(id, action.glyph, false, enabled, action.label)
+                    .when(enabled, |el| {
+                        el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.run_action(id, window, cx)))
+                    })
+                    .into_any_element(),
+            );
+            if let Some(menu) = action.menu {
+                let editor = cx.entity().downgrade();
+                out.push(
+                    Button::new(SharedString::from(format!("{id}-menue")))
+                        .ghost()
+                        .xsmall()
+                        .dropdown_caret(true)
+                        .dropdown_menu(move |popup, _, cx| match editor.upgrade() {
+                            Some(entity) => menu(entity.read(cx), popup.min_w(px(200.0)), editor.clone()),
+                            None => popup,
+                        })
+                        .into_any_element(),
+                );
+            }
+        }
+        out
+    }
+
+    fn options_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let bar = h_flex()
+            .w_full()
+            .flex_none()
+            .min_h(px(38.0))
+            .bg(ui_kit::CONTENT_BG)
+            .px(px(14.0))
+            .py(px(4.0))
+            .gap(px(8.0));
+        let Some(tool) = self.active_tool() else {
+            return bar;
+        };
+        let enabled = self.history.is_some();
+        let style = self.style_of(tool.id());
+        let mut row = h_flex().gap(px(8.0)).when(!enabled, |el| el.opacity(0.45));
+        for option in tool.options() {
+            match *option {
+                Opt::Color => {
+                    let swatches = PALETTE.into_iter().enumerate().map(|(i, rgb)| {
+                        let color = [rgb[0], rgb[1], rgb[2], 255];
+                        let selected = style.color == color;
+                        let c = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                        div()
+                            .id(("farbe", i))
+                            .size(px(20.0))
+                            .cursor_pointer()
+                            .child(
+                                ui_kit::painted(move |p, rect| {
+                                    if selected {
+                                        p.circle_stroke(rect.center(), 9.0, 2.0, ui_kit::ACCENT);
+                                    }
+                                    p.circle_filled(rect.center(), 7.0, c);
+                                    p.circle_stroke(rect.center(), 7.0, 1.0, Color32::from_white_alpha(40));
+                                })
+                                .size_full(),
+                            )
+                            .when(enabled, |el| {
+                                el.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.edit_style(cx, |s| s.color = color)
+                                }))
+                            })
+                    });
+                    row = row
+                        .child(h_flex().gap(px(4.0)).children(swatches))
+                        .child(div().ml(px(4.0)).child(ColorPicker::new(&self.color_picker).small()))
+                        .child(div().w(px(10.0)));
+                }
+                Opt::Width { label, .. } => {
+                    if let Some(sliders) = &self.sliders {
+                        row = row
+                            .child(text(label, BODY_SIZE, TEXT_WEAK))
+                            .child(div().w(px(140.0)).child(Slider::new(&sliders.width).disabled(!enabled)))
+                            .child(strong(format!("{}", style.width.round()), SMALL_SIZE, TEXT).w(px(24.0)))
+                            .child(div().w(px(6.0)));
+                    }
+                }
+                Opt::Filled(label) => {
+                    row = row.child(text(label, BODY_SIZE, TEXT_WEAK)).child(
+                        Switch::new("gefuellt").checked(style.filled).disabled(!enabled).on_click(cx.listener(
+                            |this, on: &bool, _, cx| {
+                                let on = *on;
+                                this.edit_style(cx, |s| s.filled = on);
+                            },
+                        )),
+                    );
+                }
+                Opt::Redact => {
+                    let modes = RedactMode::ALL.into_iter().enumerate().map(|(i, mode)| {
+                        Button::new(("modus", i))
+                            .small()
+                            .label(mode.label())
+                            .selected(style.redact == mode)
+                            .disabled(!enabled)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.edit_style(cx, |s| s.redact = mode)
+                            }))
+                    });
+                    row = row.child(h_flex().gap(px(2.0)).children(modes)).child(div().w(px(6.0)));
+                }
+                Opt::SoftEdge => {
+                    if style.redact != RedactMode::Blur {
+                        continue;
+                    }
+                    if let Some(sliders) = &self.sliders {
+                        row = row.child(self.soft_edge_popover(&style, sliders.softness.clone(), cx));
+                    }
+                }
+            }
+        }
+        bar.child(row)
+            .child(div().flex_1())
+            .child(div().min_w_0().truncate().child(text(tool.hint(), SMALL_SIZE, TEXT_FAINT)))
+    }
+
+    fn soft_edge_popover(&self, style: &Style, softness: Entity<SliderState>, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = if style.soft_edge {
+            format!("Weicher Rand: {} px", style.softness.round())
+        } else {
+            "Harter Rand".to_string()
+        };
+        let editor = cx.entity().downgrade();
+        Popover::new("weicher-rand")
+            .trigger(
+                Button::new("weicher-rand-knopf")
+                    .small()
+                    .label(label)
+                    .dropdown_caret(true)
+                    .tooltip("Runde Ecken und ein nach außen auslaufender Rand"),
+            )
+            .content(move |_, _, cx| {
+                let on = editor
+                    .upgrade()
+                    .map(|e| e.read(cx).current_style().soft_edge)
+                    .unwrap_or(false);
+                let editor = editor.clone();
+                v_flex()
+                    .w(px(240.0))
+                    .gap(px(10.0))
+                    .p(px(4.0))
+                    .child(
+                        h_flex().justify_between().child(text("Weicher Rand", BODY_SIZE, TEXT)).child(
+                            Switch::new("weich").checked(on).on_click(move |on: &bool, _, cx| {
+                                let on = *on;
+                                let _ = editor.update(cx, |this, cx| this.edit_style(cx, |s| s.soft_edge = on));
+                            }),
+                        ),
+                    )
+                    .child(text("Weichheit", SMALL_SIZE, TEXT_WEAK))
+                    .child(Slider::new(&softness).disabled(!on))
+            })
+    }
+
+    fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let left: Option<AnyElement> = if let Some(busy) = self.busy {
+            Some(
+                h_flex()
+                    .gap(px(6.0))
+                    .child(Spinner::new().small().color(ui_kit::ACCENT.into()))
+                    .child(text(busy, SMALL_SIZE, TEXT_WEAK))
+                    .into_any_element(),
+            )
+        } else if let Some(status) = &self.status {
+            let color = if status.error { ui_kit::RED } else { ui_kit::GREEN };
+            Some(
+                h_flex()
+                    .min_w_0()
+                    .gap(px(6.0))
+                    .child(div().size(px(7.0)).flex_none().rounded_full().bg(color))
+                    .child(div().min_w_0().truncate().child(text(status.text.clone(), SMALL_SIZE, TEXT_WEAK)))
+                    .into_any_element(),
+            )
+        } else {
+            self.file
+                .as_ref()
+                .map(|file| text(file.display().to_string(), SMALL_SIZE, TEXT_FAINT).truncate().into_any_element())
+        };
+        let right = self.view.map(|view| {
+            let (w, h) = self.image_size;
+            h_flex()
+                .flex_none()
+                .gap(px(8.0))
+                .child(text(format!("{w} × {h} px"), SMALL_SIZE, TEXT_FAINT))
+                .child(text(format!("{:.0} %", view.scale * self.last_scale * 100.0), SMALL_SIZE, TEXT_WEAK))
+                .child(
+                    button("hundert", "100 %")
+                        .xsmall()
+                        .tooltip("Strg+1")
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.zoom_to(1.0 / window.scale_factor(), None);
+                            cx.notify();
+                        })),
+                )
+                .child(button("einpassen", "Einpassen").xsmall().tooltip("Strg+0").on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        this.fit_view();
+                        cx.notify();
+                    },
+                )))
+        });
+        h_flex()
+            .w_full()
+            .flex_none()
+            .h(px(30.0))
+            .bg(ui_kit::SIDEBAR_BG)
+            .px(px(12.0))
+            .gap(px(10.0))
+            .child(div().flex_1().min_w_0().children(left))
+            .children(right)
+    }
+
+    fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div().flex_1().w_full().flex().items_center().justify_center().child(
+            v_flex()
+                .id("leer")
+                .w(px(420.0))
+                .items_center()
+                .p(px(24.0))
+                .gap(px(6.0))
+                .rounded(px(14.0))
+                .bg(ui_kit::GROUP_BG)
+                .border_1()
+                .border_color(ui_kit::DIVIDER)
+                .drag_over::<ExternalPaths>(|style, _, _, _| style.border_2().border_color(ui_kit::ACCENT))
+                .child(strong("Screenshot aufnehmen oder Bild öffnen", 17.0, TEXT).mt(px(8.0)))
+                .child(text("Oder ein Bild hierher ziehen bzw. mit Strg+V einfügen.", BODY_SIZE, TEXT_WEAK))
+                .child(div().h(px(16.0)))
+                .child(
+                    primary_button("leer-neu", "Neuer Screenshot")
+                        .w(px(220.0))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, _| this.new_capture(window))),
+                )
+                .child(button("leer-oeffnen", "Bild öffnen …").w(px(220.0)).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        this.open_dialog();
+                        cx.notify();
+                    },
+                )))
+                .child(button("leer-einfuegen", "Aus Zwischenablage einfügen").w(px(220.0)).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        this.paste();
+                        cx.notify();
+                    },
+                ))),
+        )
+    }
+
+    fn canvas_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity();
+        let area_cell = self.area.clone();
+        let cursor = if self.panning.is_some() {
+            CursorStyle::ClosedHand
+        } else if self.space_down {
+            CursorStyle::OpenHand
+        } else {
+            self.active_tool().map(|t| t.cursor()).unwrap_or_default()
+        };
+        let area = self.area.get();
+
+        let surface = canvas(
+            move |bounds, window, _| {
+                let rect = ui_kit::to_rect(bounds);
+                if area_cell.get() != rect {
+                    area_cell.set(rect);
+                    // Ansicht für die neue Größe einpassen: noch ein Bild zeichnen.
+                    window.refresh();
+                }
+                window.insert_hitbox(bounds, HitboxBehavior::Normal)
+            },
+            move |_, hitbox, window, cx| {
+                window.set_cursor_style(cursor, &hitbox);
+                let weak = this.downgrade();
+                let hb = hitbox.clone();
+                window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble && hb.is_hovered(window) {
+                        let _ = weak.update(cx, |ed, cx| ed.mouse_down(e, window, cx));
+                    }
+                });
+                let weak = this.downgrade();
+                window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        let _ = weak.update(cx, |ed, cx| ed.mouse_move(e, window, cx));
+                    }
+                });
+                let weak = this.downgrade();
+                window.on_mouse_event(move |e: &MouseUpEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        let _ = weak.update(cx, |ed, cx| ed.mouse_up(e, window, cx));
+                    }
+                });
+                let weak = this.downgrade();
+                let hb = hitbox.clone();
+                window.on_mouse_event(move |e: &ScrollEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble && hb.is_hovered(window) {
+                        let _ = weak.update(cx, |ed, cx| ed.scroll(e, cx));
+                    }
+                });
+                this.read(cx).paint_canvas(window);
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+
+        // Textfeld des Text-Werkzeugs über dem Bild.
+        let text_field = match (self.text_at, self.view) {
+            (Some(pos), Some(view)) => {
+                let style = self.style_of("text");
+                let size = (style.width * view.scale).max(8.0);
+                let value = self.text_input.read(cx).value();
+                let longest = value.lines().map(|l| l.chars().count()).max().unwrap_or(0) as f32;
+                let width = (size * 0.62 * (longest + 2.0)).max(size * 4.0);
+                let at = view.to_screen(pos) - vec2(4.0, 4.0) - area.min.to_vec2();
+                Some(
+                    div()
+                        .absolute()
+                        .left(px(at.x))
+                        .top(px(at.y))
+                        .occlude()
+                        .p(px(3.0))
+                        .border_1()
+                        .border_color(ui_kit::ACCENT)
+                        .bg(Color32::from_black_alpha(40))
+                        .child(
+                            div()
+                                .w(px(width))
+                                .text_size(px(size))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(style.color())
+                                .child(Textarea::new(&self.text_input).appearance(false)),
+                        ),
+                )
+            }
+            _ => None,
+        };
+
+        // Knöpfe des Werkzeugs (z. B. Zuschneiden).
+        let controls = match (self.active_tool(), self.view, &self.history) {
+            (Some(tool), Some(view), Some(history)) => tool.controls(view, &history.doc),
+            _ => None,
+        };
+        let controls = controls.map(|controls| {
+            let local = |p: Pos2| p - area.min.to_vec2();
+            let anchor = local(controls.anchor);
+            let max_top = area.height() - 44.0;
+            let buttons = controls.buttons.into_iter().map(|(id, label, primary)| {
+                let b = if primary { primary_button(id, label) } else { button(id, label) };
+                b.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.with_tool(false, |tool, tcx| tool.command(id, tcx));
+                    cx.notify();
+                }))
+            });
+            let label = controls.label.map(|(at, label)| {
+                let at = local(at);
+                div()
+                    .absolute()
+                    .left(px(at.x))
+                    .top(px((at.y - 18.0).max(2.0)))
+                    .child(text(label, SMALL_SIZE, Color32::WHITE))
+            });
+            div()
+                .absolute()
+                .size_full()
+                .top_0()
+                .left_0()
+                .children(label)
+                .child(
+                    h_flex()
+                        .absolute()
+                        .right(px((area.width() - anchor.x).max(4.0)))
+                        .top(px(anchor.y.min(max_top).max(4.0)))
+                        .occlude()
+                        .gap(px(6.0))
+                        .p(px(6.0))
+                        .rounded(px(8.0))
+                        .bg(ui_kit::GROUP_BG)
+                        .border_1()
+                        .border_color(ui_kit::DIVIDER)
+                        .children(buttons),
+                )
+        });
+
+        div()
+            .id("leinwand")
+            .flex_1()
+            .w_full()
+            .relative()
+            .overflow_hidden()
+            .child(surface)
+            .children(controls)
+            .children(text_field)
+    }
+
+    fn close_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("schliessen-dialog")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .occlude()
+            .bg(Color32::from_black_alpha(120))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                v_flex()
+                    .w(px(360.0))
+                    .p(px(20.0))
+                    .gap(px(4.0))
+                    .rounded(px(12.0))
+                    .bg(ui_kit::GROUP_BG)
+                    .border_1()
+                    .border_color(ui_kit::DIVIDER)
+                    .child(strong("Änderungen speichern?", 16.0, TEXT))
+                    .child(text("Das bearbeitete Bild wurde noch nicht gespeichert oder kopiert.", BODY_SIZE, TEXT_WEAK))
+                    .child(
+                        h_flex()
+                            .mt(px(14.0))
+                            .gap(px(8.0))
+                            .child(primary_button("dlg-speichern", "Speichern …").on_click(cx.listener(
+                                |this, _: &ClickEvent, window, cx| this.close_choice(0, window, cx),
+                            )))
+                            .child(button("dlg-verwerfen", "Nicht speichern").on_click(cx.listener(
+                                |this, _: &ClickEvent, window, cx| this.close_choice(1, window, cx),
+                            )))
+                            .child(button("dlg-abbrechen", "Abbrechen").on_click(cx.listener(
+                                |this, _: &ClickEvent, window, cx| this.close_choice(2, window, cx),
+                            ))),
+                    ),
+            )
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 
-fn canvas_texture(ctx: &egui::Context, name: &str, canvas: &Canvas) -> egui::TextureHandle {
-    let (w, h) = (canvas.pixmap.width(), canvas.pixmap.height());
-    let max = ctx.input(|i| i.max_texture_side) as u32;
-    if w.max(h) <= max {
-        let options = egui::TextureOptions {
-            magnification: egui::TextureFilter::Nearest,
-            minification: egui::TextureFilter::Linear,
-            ..Default::default()
-        };
-        let image = egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], canvas.pixmap.data());
-        return ctx.load_texture(name, image, options);
-    }
-    super::overlay::upload(ctx, name, &canvas.to_image(), max).0
+/// Leinwand (vormultipliziertes RGBA) als Bild für GPUI.
+fn canvas_image(canvas: &Canvas) -> Arc<RenderImage> {
+    ui_kit::render_premultiplied(canvas.pixmap.width(), canvas.pixmap.height(), canvas.pixmap.data())
 }
 
-fn divider(ui: &mut Ui) {
-    ui.add_space(4.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(1.0, 22.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, ui_kit::DIVIDER);
-    ui.add_space(4.0);
-}
-
-fn swatch(ui: &mut Ui, color: [u8; 4], selected: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
-    let painter = ui.painter();
-    let c = Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
-    if selected {
-        painter.circle_stroke(rect.center(), 10.0, Stroke::new(2.0, ui_kit::ACCENT));
-    }
-    painter.circle_filled(rect.center(), 7.0, c);
-    painter.circle_stroke(rect.center(), 7.0, Stroke::new(1.0, Color32::from_white_alpha(40)));
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-fn checkerboard(painter: &egui::Painter, rect: Rect) {
+fn checkerboard(p: &mut Painter, rect: Rect) {
     if !rect.is_positive() {
         return;
     }
-    painter.rect_filled(rect, 0.0, Color32::from_gray(0xCC));
+    p.rect_filled(rect, 0.0, Color32::from_gray(0xCC));
     let tile = 10.0;
     let mut y = rect.min.y;
     let mut row = 0;
@@ -1377,7 +1811,7 @@ fn checkerboard(painter: &egui::Painter, rect: Rect) {
         let mut x = rect.min.x + if row % 2 == 0 { 0.0 } else { tile };
         while x < rect.max.x {
             let r = Rect::from_min_max(pos2(x, y), pos2((x + tile).min(rect.max.x), (y + tile).min(rect.max.y)));
-            painter.rect_filled(r, 0.0, Color32::from_gray(0xF2));
+            p.rect_filled(r, 0.0, Color32::from_gray(0xF2));
             x += tile * 2.0;
         }
         y += tile;
@@ -1388,4 +1822,3 @@ fn checkerboard(painter: &egui::Painter, rect: Rect) {
 fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
-

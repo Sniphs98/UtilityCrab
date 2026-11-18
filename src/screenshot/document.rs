@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use eframe::egui::{Rect, Vec2};
+use crate::geom::{Rect, Vec2};
 use image::RgbaImage;
 
 use super::annotations::{Annotation, Spotlight};
@@ -55,7 +55,7 @@ impl Document {
     }
 
     /// Oberste Anmerkung unter `p`.
-    pub fn hit(&self, p: eframe::egui::Pos2, tolerance: f32) -> Option<usize> {
+    pub fn hit(&self, p: crate::geom::Pos2, tolerance: f32) -> Option<usize> {
         self.items.iter().rposition(|item| item.hit(p, tolerance))
     }
 

@@ -15,12 +15,13 @@ pub mod remote;
 mod render;
 mod theme;
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use eframe::egui::{self, vec2};
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use gpui_kit::*;
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
@@ -33,6 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_SHOWWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
+use crate::geom::vec2;
 pub use model::{Action, Block, Icon, Kind, Notice, Tone};
 use theme::{BOTTOM_GAP, CARD_WIDTH};
 
@@ -40,11 +42,11 @@ struct Shared {
     notice: Notice,
     /// Zählt jede Änderung, damit das Fenster den Timer neu startet.
     version: u64,
-    ctx: Option<egui::Context>,
     closed: bool,
 }
 
 /// Verbindung zu einem offenen (oder gleich offenen) Popup. Billig zu klonen, thread-sicher.
+/// Das Fenster fragt den Inhalt regelmäßig ab, Änderungen erscheinen also ohne weiteres Zutun.
 #[derive(Clone)]
 pub struct Handle(Arc<Mutex<Shared>>);
 
@@ -53,7 +55,6 @@ impl Handle {
         Self(Arc::new(Mutex::new(Shared {
             notice,
             version: 0,
-            ctx: None,
             closed: false,
         })))
     }
@@ -64,9 +65,6 @@ impl Handle {
         if shared.notice != notice {
             shared.notice = notice;
             shared.version += 1;
-            if let Some(ctx) = &shared.ctx {
-                ctx.request_repaint();
-            }
         }
     }
 
@@ -87,6 +85,8 @@ impl Handle {
 /// Zeigt `initial` und lässt `work` im Hintergrund laufen, das über den Handle aktualisiert.
 /// Kehrt zurück, wenn das Popup zu ist *und* die Arbeit fertig ist.
 /// Konnte kein Fenster geöffnet werden, kommt der letzte Inhalt zurück (z. B. für einen Toast).
+///
+/// GPUI läuft nur einmal pro Prozess: höchstens ein Aufruf von `run`/`show` je Prozess.
 pub fn run<F>(initial: Notice, work: F) -> Result<(), (String, Box<Notice>)>
 where
     F: FnOnce(&Handle) + Send,
@@ -101,173 +101,214 @@ where
 
 /// Öffnet das Popup und blockiert, bis es geschlossen ist. Muss auf dem Haupt-Thread laufen.
 pub fn show(handle: &Handle) -> Result<(), String> {
-    let width = CARD_WIDTH;
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("UtilityCrab")
-            .with_inner_size([width, 160.0])
-            // Erst außerhalb des Bildschirms; `place` setzt es, sobald die Höhe bekannt ist.
-            .with_position([-32000.0, -32000.0])
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_taskbar(false)
-            .with_active(false)
-            .with_always_on_top(),
-        ..Default::default()
-    };
-    let result = eframe::run_native(
-        "UtilityCrab-Hinweis",
-        options,
-        Box::new(|cc| {
-            crate::settings_ui::apply_theme(&cc.egui_ctx);
-            style(&cc.egui_ctx);
-            handle.0.lock().unwrap().ctx = Some(cc.egui_ctx.clone());
-            let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
-                Ok(RawWindowHandle::Win32(h)) => Some(HWND(h.hwnd.get() as *mut _)),
-                _ => None,
-            };
+    let opened = Rc::new(Cell::new(false));
+    let handle_for_app = handle.clone();
+    let opened_for_app = opened.clone();
+    crate::ui_kit::run_app(move |cx| {
+        let bounds = Bounds::new(point(px(-32000.0), px(-32000.0)), size(px(CARD_WIDTH), px(160.0)));
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: None,
+            focus: false,
+            show: true,
+            kind: WindowKind::PopUp,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            // Das Popup ist nie aktiv – trotzdem flüssig animieren.
+            inactive_frame_interval: None,
+            app_id: Some("UtilityCrab-Hinweis".into()),
+            ..Default::default()
+        };
+        let handle = handle_for_app.clone();
+        let result = crate::ui_kit::open_window(options, cx, move |window, cx| {
+            let hwnd = crate::ui_kit::hwnd(window);
             if let Some(hwnd) = hwnd {
-                unsafe {
-                    // Klicks aktivieren das Fenster nicht – man kann einfach weitertippen.
-                    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize);
-                    // Windows 11: runde Ecken, Schatten und ein dezenter Rahmen in Kartenfarbe.
-                    let [r, g, b, _] = theme::CARD_BORDER.to_array();
-                    let border = r as u32 | (g as u32) << 8 | (b as u32) << 16;
-                    let _ = DwmSetWindowAttribute(
-                        hwnd,
-                        DWMWA_BORDER_COLOR,
-                        &border as *const _ as *const _,
-                        size_of::<u32>() as u32,
-                    );
-                    let corners = DWMWCP_ROUND;
-                    let _ = DwmSetWindowAttribute(
-                        hwnd,
-                        DWMWA_WINDOW_CORNER_PREFERENCE,
-                        &corners as *const _ as *const _,
-                        size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
-                    );
-                }
+                style_window(hwnd);
             }
-            Ok(Box::new(Popup {
-                handle: handle.clone(),
-                hwnd,
-                placed_height: None,
-                version: u64::MAX,
-                elapsed: 0.0,
-                last_frame: Instant::now(),
-                start: Instant::now(),
-                closing: false,
-                view: render::ViewState::default(),
-            }))
-        }),
-    );
+            cx.new(|cx| Popup::new(handle, hwnd, window, cx))
+        });
+        match result {
+            Some(_) => opened_for_app.set(true),
+            None => cx.quit(),
+        }
+    });
     handle.0.lock().unwrap().closed = true;
-    result.map_err(|e| format!("Hinweisfenster: {e}"))
+    if opened.get() {
+        Ok(())
+    } else {
+        Err("Hinweisfenster konnte nicht geöffnet werden".into())
+    }
 }
 
-struct Popup {
+/// Klicks aktivieren das Fenster nicht (man kann einfach weitertippen); Windows 11 zeichnet
+/// runde Ecken, Schatten und einen dezenten Rahmen in Kartenfarbe.
+fn style_window(hwnd: HWND) {
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize);
+        let c = theme::CARD_BORDER;
+        let border = c.r as u32 | (c.g as u32) << 8 | (c.b as u32) << 16;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &border as *const _ as *const _,
+            size_of::<u32>() as u32,
+        );
+        let corners = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corners as *const _ as *const _,
+            size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+    }
+}
+
+pub struct Popup {
     handle: Handle,
     hwnd: Option<HWND>,
+    notice: Notice,
+    version: u64,
     /// Höhe, für die das Fenster zuletzt platziert wurde (logische Pixel).
     placed_height: Option<f32>,
-    version: u64,
+    measured_height: Rc<Cell<f32>>,
     /// Abgelaufene Timer-Zeit in Sekunden (steht, solange die Maus darauf ist).
     elapsed: f32,
-    last_frame: Instant,
+    last_tick: Instant,
     start: Instant,
+    hovered: bool,
     closing: bool,
-    view: render::ViewState,
+    /// Einblenden: 0 → 1, sobald das Fenster an seinem Platz ist.
+    appear: f32,
+    shown_fraction: f32,
+    pub(crate) details_open: bool,
+    _ticker: Task<()>,
 }
 
-impl eframe::App for Popup {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        egui::Rgba::from(theme::CARD_BG).to_array()
+impl Popup {
+    fn new(handle: Handle, hwnd: Option<HWND>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let (notice, version) = handle.snapshot();
+        let ticker = cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(16)).await;
+            if this.update_in(cx, |this, window, cx| this.tick(window, cx)).is_err() {
+                break;
+            }
+        });
+        Self {
+            handle,
+            hwnd,
+            shown_fraction: notice.progress().map_or(0.0, |(f, _)| f),
+            notice,
+            version,
+            placed_height: if hwnd.is_some() { None } else { Some(0.0) },
+            measured_height: Rc::new(Cell::new(0.0)),
+            elapsed: 0.0,
+            last_tick: Instant::now(),
+            start: Instant::now(),
+            hovered: false,
+            closing: false,
+            appear: 0.0,
+            details_open: false,
+            _ticker: ticker,
+        }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
+    /// Läuft etwa 60-mal pro Sekunde: Inhalt abholen, Timer, Animationen, Fenstergröße.
+    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
         let (notice, version) = self.handle.snapshot();
-        if version != self.version {
+        let changed = version != self.version;
+        if changed {
             self.version = version;
             self.elapsed = 0.0;
+            self.notice = notice;
         }
 
         let now = Instant::now();
-        let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
-        self.last_frame = now;
-        let hovered = ui.input(|i| i.pointer.has_pointer());
-        if !hovered && self.placed_height.is_some() {
+        let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.1);
+        self.last_tick = now;
+        if !self.hovered && self.placed_height.is_some() {
             self.elapsed += dt;
         }
-        let remaining = notice
-            .timeout()
-            .map(|t| 1.0 - self.elapsed / t.as_secs_f32().max(0.1));
-        if remaining.is_some_and(|r| r <= 0.0) {
-            self.closing = true;
-        }
-
-        // Inhalt kurz einblenden, sobald das Fenster an seinem Platz ist.
-        let appear = ctx.animate_bool_with_time(egui::Id::unique("einblenden"), self.placed_height.is_some(), 0.15);
-        let time = self.start.elapsed().as_secs_f64();
-
-        let mut card_rect = None;
-        let mut events = render::Events::default();
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new())
-            .show(ui, |ui| {
-                ui.set_opacity(appear);
-                let (rect, ev) = render::card(ui, &notice, &mut self.view, remaining, time);
-                card_rect = Some(rect);
-                events = ev;
-            });
-
-        if events.close {
-            self.closing = true;
-        }
-        if events.action {
-            if let Some(action) = &notice.action {
-                action.run();
+        if let Some(timeout) = self.notice.timeout() {
+            if self.elapsed >= timeout.as_secs_f32().max(0.1) {
+                self.close(window, cx);
+                return;
             }
-            self.closing = true;
         }
 
         // Fenster an den Inhalt anpassen.
-        if let (Some(rect), Some(hwnd)) = (card_rect, self.hwnd) {
-            let height = rect.height().ceil();
-            if self.placed_height.is_none_or(|h| (h - height).abs() > 0.5) {
+        let height = self.measured_height.get().ceil();
+        if let Some(hwnd) = self.hwnd {
+            if height > 0.0 && self.placed_height.is_none_or(|h| (h - height).abs() > 0.5) {
                 place(hwnd, vec2(CARD_WIDTH, height));
                 self.placed_height = Some(height);
             }
-        } else if self.hwnd.is_none() {
-            self.placed_height = Some(0.0);
         }
 
-        if self.closing {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        let target = self.notice.progress().map_or(0.0, |(f, _)| f.clamp(0.0, 1.0));
+        let before = (self.appear, self.shown_fraction);
+        if self.placed_height.is_some() {
+            self.appear = (self.appear + dt / 0.15).min(1.0);
         }
-        // Drehkreis, Timer und Animationen brauchen laufende Bilder; sonst sparsam.
-        let busy = notice.kind == Kind::Running || appear < 1.0 || remaining.is_some();
-        ctx.request_repaint_after(std::time::Duration::from_millis(if busy { 16 } else { 250 }));
+        self.shown_fraction += (target - self.shown_fraction) * (dt / 0.12).min(1.0);
+        if (self.shown_fraction - target).abs() < 0.001 {
+            self.shown_fraction = target;
+        }
+
+        // Drehkreis, Timer und Animationen brauchen laufende Bilder; sonst nur bei Änderungen.
+        let busy = self.notice.kind == Kind::Running || self.notice.timeout().is_some();
+        if changed || busy || before != (self.appear, self.shown_fraction) {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
+        window.remove_window();
+        cx.quit();
+    }
+
+    pub(crate) fn run_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(action) = &self.notice.action {
+            action.run();
+        }
+        self.close(window, cx);
     }
 }
 
-/// Ruhiger Tooltip-Stil (die Schrift setzt schon `apply_theme`).
-fn style(ctx: &egui::Context) {
-    ctx.all_styles_mut(|style| {
-        style.interaction.tooltip_delay = 0.15;
-        style.interaction.show_tooltips_only_when_still = false;
-        style.spacing.tooltip_width = 250.0;
-        style.visuals.window_fill = theme::TOOLTIP_BG;
-        style.visuals.window_stroke = egui::Stroke::new(1.0, theme::CARD_BORDER);
-        style.visuals.window_corner_radius = egui::CornerRadius::same(6);
-        style.visuals.popup_shadow = egui::Shadow::NONE;
-        style.spacing.menu_margin = egui::Margin::symmetric(8, 6);
-    });
+impl Render for Popup {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let remaining = self
+            .notice
+            .timeout()
+            .map(|t| 1.0 - self.elapsed / t.as_secs_f32().max(0.1));
+        let state = render::CardState {
+            details_open: self.details_open,
+            shown_fraction: self.shown_fraction,
+            remaining,
+            time: self.start.elapsed().as_secs_f64(),
+            measured_height: self.measured_height.clone(),
+        };
+        let card = render::card(&self.notice, &state, cx);
+        div()
+            .id("hinweis")
+            .size_full()
+            .bg(theme::CARD_BG)
+            .opacity(self.appear)
+            .on_hover(cx.listener(|this, hovered: &bool, _, _| this.hovered = *hovered))
+            .child(card)
+    }
 }
 
 /// Setzt das Fenster unten mittig auf den Bildschirm mit dem Mauszeiger, knapp über die Taskleiste.
-fn place(hwnd: HWND, size: egui::Vec2) {
+fn place(hwnd: HWND, size: crate::geom::Vec2) {
     unsafe {
         let mut cursor = POINT::default();
         let _ = GetCursorPos(&mut cursor);

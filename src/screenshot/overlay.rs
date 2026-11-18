@@ -2,29 +2,30 @@
 //! Freihand. Oben mittig eine Leiste zum Umschalten, am Mauszeiger eine Lupe mit Pixelfarbe.
 //! Rechnet intern in physischen Pixeln, damit es auf Monitoren mit Skalierung stimmt.
 //!
-//! Das Auswahlfenster liegt über allen Bildschirmen, hat für Windows aber nur eine
-//! Skalierung (die des Bildschirms, auf dem es größtenteils liegt). Deshalb wird die
-//! Skalierung von egui jedes Bild an den Bildschirm unter der Maus angepasst – sonst
-//! wären Leiste und Lupe auf einem Bildschirm mit anderer Skalierung zu groß oder zu klein.
+//! Für jeden Bildschirm gibt es ein eigenes randloses Fenster mit dessen Ausschnitt des
+//! Bildschirmfotos. So hat jedes Fenster die Skalierung seines Bildschirms, und Leiste und
+//! Lupe sind auf Bildschirmen mit unterschiedlicher Skalierung gleich groß. Die Auswahl
+//! selbst ([`Shot`]) teilen sich alle Fenster; sie kann über Bildschirmgrenzen gehen.
 
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
-use eframe::egui::{self, pos2, vec2, Align2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind};
+use gpui_kit::*;
 use image::RgbaImage;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, SetForegroundWindow, SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE,
-};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SetForegroundWindow, SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE};
 
 use super::capture::{self, PxRect, Screen};
 use super::icons::{self, Glyph};
 use super::{export, Prefs, EDIT_ARG};
+use crate::geom::{pos2, vec2, Color32, Pos2, Rect};
 use crate::popup::{Action, Block, Icon, Kind, Notice};
 use crate::settings::Settings;
-use crate::ui_kit;
+use crate::ui_kit::{self, h_flex, text, v_flex, Painter};
 
 /// Aufnahmearten. Eine neue Art: Variante + Einträge in den `match`es + Logik in `Overlay::ui`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -100,41 +101,73 @@ pub fn run(mode: Option<CaptureMode>, delay: Duration) {
         return finish(screen.image);
     }
 
-    let result: Arc<Mutex<Option<RgbaImage>>> = Arc::default();
+    let result: Rc<RefCell<Option<RgbaImage>>> = Rc::default();
     let shared = result.clone();
     let area = capture::virtual_screen();
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("UtilityCrab – Screenshot")
-            .with_position([area.x as f32, area.y as f32])
-            .with_inner_size([area.w as f32, area.h as f32])
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_taskbar(false)
-            .with_always_on_top(),
-        ..Default::default()
-    };
-    let outcome = eframe::run_native(
-        "UtilityCrab-Screenshot",
-        options,
-        Box::new(move |cc| {
-            ui_kit::apply(&cc.egui_ctx);
-            let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
-                Ok(RawWindowHandle::Win32(h)) => Some(HWND(h.hwnd.get() as *mut _)),
-                _ => None,
-            };
-            // Strg+Plus/Minus würde mit der Skalierung pro Bildschirm kollidieren.
-            cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
-            Ok(Box::new(Overlay::new(screen, area, prefs, hwnd, shared)))
-        }),
-    );
-    if let Err(e) = outcome {
-        return crate::report(Err(format!("Screenshot-Auswahl: {e}")));
-    }
-    let image = result.lock().unwrap().take();
+    ui_kit::run_app(move |cx| {
+        let monitors = if screen.monitors.is_empty() {
+            vec![PxRect { x: 0, y: 0, w: area.w, h: area.h }]
+        } else {
+            screen.monitors.clone()
+        };
+        let shot = cx.new(|_| Shot::new(screen, area, prefs, shared));
+        let mut opened = 0;
+        for (index, monitor) in monitors.into_iter().enumerate() {
+            if open_monitor_window(&shot, monitor, area, index == 0, cx) {
+                opened += 1;
+            }
+        }
+        if opened == 0 {
+            crate::report(Err("Screenshot-Auswahl: kein Fenster".into()));
+            cx.quit();
+        }
+    });
+    let image = result.borrow_mut().take();
     if let Some(image) = image {
         finish(image);
     }
+}
+
+/// Öffnet das Auswahlfenster für einen Bildschirm (`monitor` in Bildpixeln).
+fn open_monitor_window(shot: &Entity<Shot>, monitor: PxRect, area: PxRect, first: bool, cx: &mut App) -> bool {
+    // Den GPUI-Bildschirm über das Win32-Handle des Monitors finden.
+    let center = POINT {
+        x: area.x + monitor.x + monitor.w / 2,
+        y: area.y + monitor.y + monitor.h / 2,
+    };
+    let hmonitor = unsafe { MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST) };
+    let display_id = DisplayId::new(hmonitor.0 as u64);
+    let display = cx.find_display(display_id).or_else(|| cx.primary_display());
+    let bounds = display
+        .as_ref()
+        .map(|d| d.bounds())
+        .unwrap_or_else(|| Bounds::new(point(px(monitor.x as f32), px(monitor.y as f32)), size(px(monitor.w as f32), px(monitor.h as f32))));
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: None,
+        focus: first,
+        show: true,
+        kind: WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        display_id: display.map(|d| d.id()),
+        inactive_frame_interval: None,
+        app_id: Some("UtilityCrab-Screenshot".into()),
+        ..Default::default()
+    };
+    let crop = shot.read(cx).crop(monitor);
+    let shot = shot.clone();
+    ui_kit::open_window(options, cx, move |window, cx| {
+        let hwnd = ui_kit::hwnd(window);
+        let view = cx.new(|cx| MonitorWindow::new(shot, monitor, area, crop, hwnd, window, cx));
+        if first {
+            let focus = view.read(cx).focus.clone();
+            window.focus(&focus, cx);
+        }
+        view
+    })
+    .is_some()
 }
 
 /// Nach der Auswahl: kopieren, ggf. speichern, Editor öffnen oder Hinweis zeigen.
@@ -184,98 +217,59 @@ fn finish(image: RgbaImage) {
     crate::popup::remote::notify(notice);
 }
 
-struct Overlay {
+// ---------------------------------------------------------------------------------------------
+// Gemeinsame Auswahl
+
+/// Stand der Auswahl, geteilt von allen Bildschirmfenstern. Alles in Bildpixeln
+/// (physische Pixel relativ zur linken oberen Ecke des virtuellen Bildschirms).
+pub struct Shot {
     screen: Screen,
-    /// Lage des Bildes (= des Fensters) auf dem virtuellen Bildschirm.
+    /// Lage des Bildes auf dem virtuellen Bildschirm.
     area: PxRect,
-    /// Erst im ersten Bild hochgeladen: Beim Erstellen der App kennt egui die echte
-    /// Texturgrenze der Grafikkarte noch nicht (nur den Standard 2048) und würde das
-    /// Bildschirmfoto mehrerer Monitore unnötig verkleinern – also unscharf machen.
-    texture: Option<egui::TextureHandle>,
     mode: CaptureMode,
     prefs: Prefs,
-    hwnd: Option<HWND>,
-    /// Bis das Fenster sicher über allen Bildschirmen liegt (Windows passt es bei DPI-Wechseln an).
-    placement_checks: u32,
-    /// Wo zuletzt eine Maustaste gedrückt wurde (physische Pixel).
-    press_px: Option<Pos2>,
+    /// Maus gedrückt (Auswahl läuft).
+    pressed: bool,
     drag_start: Option<Pos2>,
     drag_now: Option<Pos2>,
     lasso: Vec<Pos2>,
-    result: Arc<Mutex<Option<RgbaImage>>>,
+    result: Rc<RefCell<Option<RgbaImage>>>,
+    done: bool,
 }
 
-impl Overlay {
-    fn new(screen: Screen, area: PxRect, prefs: Prefs, hwnd: Option<HWND>, result: Arc<Mutex<Option<RgbaImage>>>) -> Self {
+impl Shot {
+    fn new(screen: Screen, area: PxRect, prefs: Prefs, result: Rc<RefCell<Option<RgbaImage>>>) -> Self {
         Self {
             screen,
             area,
-            texture: None,
             mode: prefs.mode,
             prefs,
-            hwnd,
-            placement_checks: 30,
-            press_px: None,
+            pressed: false,
             drag_start: None,
             drag_now: None,
             lasso: Vec::new(),
             result,
+            done: false,
         }
     }
 
-    fn texture_id(&mut self, ctx: &egui::Context) -> egui::TextureId {
-        self.texture
-            .get_or_insert_with(|| {
-                let max = ctx.input(|i| i.max_texture_side) as u32;
-                upload(ctx, "bildschirm", &self.screen.image, max).0
-            })
-            .id()
+    /// Ausschnitt des Bildschirmfotos für ein Fenster.
+    fn crop(&self, monitor: PxRect) -> Arc<RenderImage> {
+        let (w, h) = self.screen.image.dimensions();
+        let image = match monitor.clip(w, h) {
+            Some(r) => image::imageops::crop_imm(&self.screen.image, r.x as u32, r.y as u32, r.w as u32, r.h as u32).to_image(),
+            None => RgbaImage::new(1, 1),
+        };
+        ui_kit::render_image(&image)
     }
 
-    /// Mauszeiger in Bildpixeln, direkt von Windows. egui kennt die Position nur in
-    /// Punkten, und die passen nach einem Skalierungswechsel erst wieder, wenn sich
-    /// die Maus bewegt.
+    /// Mauszeiger in Bildpixeln, direkt von Windows – stimmt auf jedem Bildschirm, egal in
+    /// welchem Fenster das Ereignis ankam.
     fn cursor_px(&self) -> Option<Pos2> {
         capture::cursor_pos().map(|(x, y)| pos2((x - self.area.x) as f32, (y - self.area.y) as f32))
     }
 
-    /// Skalierung des Bildschirms unter der Maus übernehmen. Nicht während gedrückter
-    /// Maustaste, damit sich eine laufende Auswahl nicht unter der Hand verschiebt.
-    fn follow_monitor_scale(&self, ctx: &egui::Context) {
-        if ctx.input(|i| i.pointer.any_down()) {
-            return;
-        }
-        let Some((x, y)) = capture::cursor_pos() else {
-            return;
-        };
-        let target = capture::scale_at(x, y);
-        if (ctx.pixels_per_point() - target).abs() > 0.001 {
-            ctx.set_pixels_per_point(target);
-        }
-    }
-
-    fn place_window(&mut self) {
-        let Some(hwnd) = self.hwnd else {
-            return;
-        };
-        if self.placement_checks == 0 {
-            return;
-        }
-        self.placement_checks -= 1;
-        let area = capture::virtual_screen();
-        unsafe {
-            let mut rect = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut rect);
-            if (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top) != (area.x, area.y, area.w, area.h) {
-                let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), area.x, area.y, area.w, area.h, SWP_NOACTIVATE);
-            }
-            if self.placement_checks % 10 == 9 {
-                let _ = SetForegroundWindow(hwnd);
-            }
-        }
-    }
-
-    /// Fenster unter dem Punkt (physische Pixel), sonst der Bildschirm.
+    /// Fenster unter dem Punkt, sonst der Bildschirm.
     fn window_at(&self, p: Pos2) -> Option<PxRect> {
         self.screen
             .windows
@@ -289,16 +283,119 @@ impl Overlay {
         self.screen.monitors.iter().find(|m| m.contains(p.x, p.y)).copied()
     }
 
-    fn select(&mut self, rect: PxRect, ctx: &egui::Context) {
+    fn selection(&self) -> Option<PxRect> {
+        let (a, b) = (self.drag_start?, self.drag_now?);
+        let r = Rect::from_two_pos(a, b);
+        Some(PxRect {
+            x: r.min.x.round() as i32,
+            y: r.min.y.round() as i32,
+            w: r.width().round() as i32,
+            h: r.height().round() as i32,
+        })
+    }
+
+    fn press(&mut self) {
+        let Some(p) = self.cursor_px() else {
+            return;
+        };
+        self.pressed = true;
+        match self.mode {
+            CaptureMode::Rect => {
+                // Ab dem Klickpunkt, nicht erst ab einer Zieh-Schwelle.
+                self.drag_start = Some(p);
+                self.drag_now = Some(p);
+            }
+            CaptureMode::Freeform => self.lasso = vec![p],
+            CaptureMode::Window | CaptureMode::Screen => {}
+        }
+    }
+
+    fn moved(&mut self) {
+        if !self.pressed {
+            return;
+        }
+        let Some(p) = self.cursor_px() else {
+            return;
+        };
+        match self.mode {
+            CaptureMode::Rect => self.drag_now = Some(p),
+            CaptureMode::Freeform => {
+                if self.lasso.last().is_none_or(|l| l.distance(p) >= 2.0) {
+                    self.lasso.push(p);
+                }
+            }
+            CaptureMode::Window | CaptureMode::Screen => {}
+        }
+    }
+
+    fn release(&mut self, cx: &mut Context<Self>) {
+        if !self.pressed {
+            return;
+        }
+        self.pressed = false;
+        let p = self.cursor_px();
+        match self.mode {
+            CaptureMode::Rect => {
+                let selection = self.selection();
+                self.drag_start = None;
+                self.drag_now = None;
+                match selection.filter(|s| s.w >= 3 && s.h >= 3) {
+                    Some(sel) => self.select(sel, cx),
+                    // Nur geklickt: das Fenster darunter.
+                    None => {
+                        if let Some(win) = p.and_then(|p| self.window_at(p)) {
+                            self.select(win, cx);
+                        }
+                    }
+                }
+            }
+            CaptureMode::Window | CaptureMode::Screen => {
+                let target = p.and_then(|p| {
+                    if self.mode == CaptureMode::Window {
+                        self.window_at(p)
+                    } else {
+                        self.monitor_at(p)
+                    }
+                });
+                if let Some(t) = target {
+                    self.select(t, cx);
+                }
+            }
+            CaptureMode::Freeform => self.select_lasso(cx),
+        }
+    }
+
+    fn key(&mut self, key: &str, cx: &mut Context<Self>) {
+        match key {
+            "escape" => {
+                if self.drag_start.is_some() || !self.lasso.is_empty() {
+                    self.pressed = false;
+                    self.drag_start = None;
+                    self.drag_now = None;
+                    self.lasso.clear();
+                } else {
+                    cx.quit();
+                }
+            }
+            "enter" if self.mode == CaptureMode::Screen => {
+                let (w, h) = self.screen.image.dimensions();
+                self.select(PxRect { x: 0, y: 0, w: w as i32, h: h as i32 }, cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn select(&mut self, rect: PxRect, cx: &mut Context<Self>) {
         let (w, h) = self.screen.image.dimensions();
         if let Some(r) = rect.clip(w, h) {
             let image = image::imageops::crop_imm(&self.screen.image, r.x as u32, r.y as u32, r.w as u32, r.h as u32).to_image();
-            *self.result.lock().unwrap() = Some(image);
+            *self.result.borrow_mut() = Some(image);
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        self.done = true;
+        cx.quit();
     }
 
-    fn select_lasso(&mut self, ctx: &egui::Context) {
+    fn select_lasso(&mut self, cx: &mut Context<Self>) {
         if self.lasso.len() < 3 {
             self.lasso.clear();
             return;
@@ -324,13 +421,16 @@ impl Overlay {
                 px.0[3] = ((px.0[3] as u16 * *m as u16) / 255) as u8;
             }
         }
-        *self.result.lock().unwrap() = Some(image);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        *self.result.borrow_mut() = Some(image);
+        self.done = true;
+        cx.quit();
     }
 
     fn set_mode(&mut self, mode: CaptureMode) {
         self.mode = mode;
+        self.pressed = false;
         self.drag_start = None;
+        self.drag_now = None;
         self.lasso.clear();
         if self.prefs.mode != mode {
             self.prefs.mode = mode;
@@ -339,313 +439,417 @@ impl Overlay {
     }
 }
 
-impl eframe::App for Overlay {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 1.0]
-    }
+// ---------------------------------------------------------------------------------------------
+// Ein Fenster pro Bildschirm
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.place_window();
-        self.follow_monitor_scale(&ctx);
-        let ppp = ctx.pixels_per_point();
-        let cursor_px = self.cursor_px();
-        if ctx.input(|i| i.pointer.any_pressed()) {
-            self.press_px = cursor_px;
-        }
-        let texture = self.texture_id(&ctx);
-        let to_pt = |p: Pos2| pos2(p.x / ppp, p.y / ppp);
-        let rect_pt = |r: PxRect| Rect::from_min_size(pos2(r.x as f32, r.y as f32) / ppp, vec2(r.w as f32, r.h as f32) / ppp);
-        let (w, h) = self.screen.image.dimensions();
-        let full = Rect::from_min_size(Pos2::ZERO, vec2(w as f32, h as f32) / ppp);
+struct MonitorWindow {
+    shot: Entity<Shot>,
+    /// Bereich dieses Bildschirms im Bild (physische Pixel).
+    monitor: PxRect,
+    area: PxRect,
+    image: Arc<RenderImage>,
+    hwnd: Option<HWND>,
+    focus: FocusHandle,
+    /// Lupe: Pixel, für den sie zuletzt gebaut wurde, und ihr Bild.
+    magnifier: Option<((u32, u32), Arc<RenderImage>)>,
+    stale_images: Vec<Arc<RenderImage>>,
+    _observe: Subscription,
+    _placement: Task<()>,
+}
 
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.drag_start.is_some() || !self.lasso.is_empty() {
-                self.drag_start = None;
-                self.lasso.clear();
-            } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
-        if self.mode == CaptureMode::Screen && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-            self.select(PxRect { x: 0, y: 0, w: w as i32, h: h as i32 }, &ctx);
-        }
-
-        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-            let response = ui.interact(full, egui::Id::unique("auswahl"), Sense::click_and_drag());
-            let painter = ui.painter().clone();
-            painter.image(texture, full, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-
-            let pointer_px = cursor_px
-                .or_else(|| response.hover_pos().or(ctx.pointer_latest_pos()).map(|p| pos2(p.x * ppp, p.y * ppp)));
-            let dim = Color32::from_black_alpha(110);
-            let mut highlight: Option<PxRect> = None;
-            let mut magnifier = false;
-
-            match self.mode {
-                CaptureMode::Rect => {
-                    if response.drag_started() {
-                        // Ab dem Klickpunkt, nicht erst ab der Zieh-Schwelle.
-                        let origin = ctx.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
-                        self.drag_start = self.press_px.or(origin.map(|p| pos2(p.x * ppp, p.y * ppp)));
-                    }
-                    if response.dragged() {
-                        self.drag_now = pointer_px;
-                    }
-                    let selection = match (self.drag_start, self.drag_now) {
-                        (Some(a), Some(b)) => {
-                            let r = Rect::from_two_pos(a, b);
-                            Some(PxRect {
-                                x: r.min.x.round() as i32,
-                                y: r.min.y.round() as i32,
-                                w: r.width().round() as i32,
-                                h: r.height().round() as i32,
-                            })
-                        }
-                        _ => None,
-                    };
-                    if response.drag_stopped() {
-                        self.drag_start = None;
-                        self.drag_now = None;
-                        if let Some(sel) = selection.filter(|s| s.w >= 3 && s.h >= 3) {
-                            return self.select(sel, &ctx);
-                        }
-                    }
-                    if response.clicked() {
-                        if let Some(win) = pointer_px.and_then(|p| self.window_at(p)) {
-                            return self.select(win, &ctx);
-                        }
-                    }
-                    match selection {
-                        Some(sel) => highlight = Some(sel),
-                        None => {
-                            // Vor dem Ziehen: das Fenster unter der Maus dezent andeuten.
-                            if let Some(win) = pointer_px.and_then(|p| self.window_at(p)) {
-                                painter.rect_filled(full, 0.0, dim);
-                                painter.rect_filled(rect_pt(win), 0.0, Color32::from_white_alpha(10));
-                                painter.rect_stroke(rect_pt(win), 0.0, Stroke::new(1.0, Color32::from_white_alpha(70)), StrokeKind::Inside);
-                            }
-                        }
-                    }
-                    magnifier = true;
-                }
-                CaptureMode::Window | CaptureMode::Screen => {
-                    let target = pointer_px.and_then(|p| {
-                        if self.mode == CaptureMode::Window {
-                            self.window_at(p)
-                        } else {
-                            self.monitor_at(p)
-                        }
-                    });
-                    if response.clicked() {
-                        if let Some(t) = target {
-                            return self.select(t, &ctx);
-                        }
-                    }
-                    highlight = target;
-                }
-                CaptureMode::Freeform => {
-                    if response.drag_started() {
-                        self.lasso.clear();
-                        let origin = ctx.input(|i| i.pointer.press_origin()).map(|p| pos2(p.x * ppp, p.y * ppp));
-                        if let Some(p) = self.press_px.or(origin) {
-                            self.lasso.push(p);
-                        }
-                    }
-                    if response.dragged() {
-                        if let Some(p) = pointer_px {
-                            if self.lasso.last().is_none_or(|l| l.distance(p) >= 2.0) {
-                                self.lasso.push(p);
-                            }
-                        }
-                    }
-                    if response.drag_stopped() {
-                        return self.select_lasso(&ctx);
-                    }
-                    painter.rect_filled(full, 0.0, dim);
-                    if self.lasso.len() > 1 {
-                        let points: Vec<Pos2> = self.lasso.iter().map(|p| to_pt(*p)).collect();
-                        painter.add(egui::Shape::line(points.clone(), Stroke::new(3.0, Color32::from_black_alpha(120))));
-                        painter.add(egui::Shape::line(points, Stroke::new(1.5, Color32::WHITE)));
-                    }
-                    magnifier = true;
+impl MonitorWindow {
+    fn new(
+        shot: Entity<Shot>,
+        monitor: PxRect,
+        area: PxRect,
+        image: Arc<RenderImage>,
+        hwnd: Option<HWND>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let observe = cx.observe(&shot, |_, _, cx| cx.notify());
+        // Windows passt neue Fenster bei unterschiedlicher Skalierung manchmal an: eine Weile
+        // prüfen, dass das Fenster genau auf seinem Bildschirm liegt.
+        let placement = cx.spawn_in(window, async move |this, cx| {
+            for check in 0..30u32 {
+                cx.background_executor().timer(Duration::from_millis(33)).await;
+                let ok = this.update_in(cx, |this, window, _| this.place_window(check, window));
+                if ok.is_err() {
+                    break;
                 }
             }
-
-            if let Some(sel) = highlight {
-                let r = rect_pt(sel);
-                for part in [
-                    Rect::from_min_max(full.min, pos2(full.max.x, r.min.y)),
-                    Rect::from_min_max(pos2(full.min.x, r.max.y), full.max),
-                    Rect::from_min_max(pos2(full.min.x, r.min.y), pos2(r.min.x, r.max.y)),
-                    Rect::from_min_max(pos2(r.max.x, r.min.y), pos2(full.max.x, r.max.y)),
-                ] {
-                    painter.rect_filled(part, 0.0, dim);
-                }
-                painter.rect_stroke(r, 0.0, Stroke::new(2.0, ui_kit::ACCENT), StrokeKind::Outside);
-                size_label(&painter, r, full, &format!("{} × {}", sel.w, sel.h));
-            } else if self.mode == CaptureMode::Rect && self.drag_start.is_none() && pointer_px.is_none() {
-                painter.rect_filled(full, 0.0, dim);
-            }
-
-            if magnifier {
-                if let Some(p) = pointer_px {
-                    self.magnifier(&painter, texture, p, ppp, full);
-                }
-            }
-            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         });
+        Self {
+            shot,
+            monitor,
+            area,
+            image,
+            hwnd,
+            focus: cx.focus_handle(),
+            magnifier: None,
+            stale_images: Vec::new(),
+            _observe: observe,
+            _placement: placement,
+        }
+    }
 
-        self.toolbar(&ctx, full, cursor_px);
-        ctx.request_repaint_after(Duration::from_millis(16));
+    fn place_window(&mut self, check: u32, window: &mut Window) {
+        let Some(hwnd) = self.hwnd else {
+            return;
+        };
+        let (x, y, w, h) = (self.area.x + self.monitor.x, self.area.y + self.monitor.y, self.monitor.w, self.monitor.h);
+        unsafe {
+            let mut rect = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rect);
+            if (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top) != (x, y, w, h) {
+                let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE);
+            }
+            if check % 10 == 0 && window.is_window_active() {
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
+    }
+
+    /// Physische Pixel pro logischem Pixel in diesem Fenster.
+    fn px_per_pt(&self, window: &Window) -> f32 {
+        let width = window.viewport_size().width.as_f32();
+        if width > 0.0 {
+            self.monitor.w as f32 / width
+        } else {
+            window.scale_factor()
+        }
+    }
+
+    /// Lupenbild (vergrößerte Pixel um `px`), nur neu gebaut, wenn sich der Pixel ändert.
+    fn magnifier_image(&mut self, shot: &Shot, px: (u32, u32), scale: f32) -> Arc<RenderImage> {
+        if let Some((at, image)) = &self.magnifier {
+            if *at == px {
+                return image.clone();
+            }
+        }
+        let (w, h) = shot.screen.image.dimensions();
+        // So groß, dass jeder Bildpixel scharf als Block erscheint.
+        let k = ((MAGNIFIER_SIZE * scale) / MAGNIFIER_CELLS as f32).ceil().max(1.0) as u32;
+        let side = MAGNIFIER_CELLS * k;
+        let half = MAGNIFIER_CELLS as i64 / 2;
+        let mut out = RgbaImage::from_pixel(side, side, image::Rgba([0, 0, 0, 255]));
+        for cy in 0..MAGNIFIER_CELLS {
+            for cx in 0..MAGNIFIER_CELLS {
+                let sx = px.0 as i64 + cx as i64 - half;
+                let sy = px.1 as i64 + cy as i64 - half;
+                if sx < 0 || sy < 0 || sx >= w as i64 || sy >= h as i64 {
+                    continue;
+                }
+                let color = *shot.screen.image.get_pixel(sx as u32, sy as u32);
+                for y in 0..k {
+                    for x in 0..k {
+                        out.put_pixel(cx * k + x, cy * k + y, image::Rgba([color.0[0], color.0[1], color.0[2], 255]));
+                    }
+                }
+            }
+        }
+        let image = ui_kit::render_image(&out);
+        if let Some((_, old)) = self.magnifier.replace((px, image.clone())) {
+            self.stale_images.push(old);
+        }
+        image
     }
 }
 
-impl Overlay {
-    fn toolbar(&mut self, ctx: &egui::Context, full: Rect, cursor_px: Option<Pos2>) {
-        let mut chosen = None;
-        let mut close = false;
-        let mut bar_rect = Rect::NOTHING;
-        // Auf dem Bildschirm mit der Maus, sonst dem ersten.
-        let monitor = cursor_px
-            .or_else(|| ctx.pointer_latest_pos().map(|p| p * ctx.pixels_per_point()))
-            .and_then(|p| self.monitor_at(p))
-            .or_else(|| self.screen.monitors.first().copied());
-        let ppp = ctx.pixels_per_point();
-        let top_center = monitor
-            .map(|m| pos2((m.x as f32 + m.w as f32 / 2.0) / ppp, m.y as f32 / ppp + 14.0))
-            .unwrap_or(pos2(full.center().x, 14.0));
-        egui::Area::new(egui::Id::unique("aufnahme-leiste"))
-            .fixed_pos(top_center)
-            .pivot(Align2::CENTER_TOP)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let frame = egui::Frame::new()
-                    .fill(ui_kit::GROUP_BG)
-                    .stroke(Stroke::new(1.0, ui_kit::DIVIDER))
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(egui::Margin::same(5))
-                    .shadow(egui::Shadow {
-                        offset: [0, 4],
-                        blur: 16,
-                        spread: 0,
-                        color: Color32::from_black_alpha(110),
-                    });
-                let inner = frame.show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        for mode in CaptureMode::ALL {
-                            if icons::button(ui, mode.glyph(), self.mode == mode, true, mode.label()).clicked() {
-                                chosen = Some(mode);
-                            }
-                        }
-                        ui.add_space(4.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-                        if icons::button(ui, Glyph::Close, false, true, "Abbrechen (Esc)").clicked() {
-                            close = true;
-                        }
-                    });
-                });
-                bar_rect = inner.response.rect;
-            });
-        // Bedienhilfe als kleine Pille unter der Leiste.
-        egui::Area::new(egui::Id::unique("aufnahme-hinweis"))
-            .fixed_pos(pos2(top_center.x, bar_rect.bottom() + 8.0))
-            .pivot(Align2::CENTER_TOP)
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_black_alpha(170))
-                    .corner_radius(CornerRadius::same(12))
-                    .inner_margin(egui::Margin::symmetric(12, 5))
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new(self.mode.hint()).font(ui_kit::regular(ui_kit::SMALL_SIZE)).color(Color32::WHITE));
-                    });
-            });
-        if let Some(mode) = chosen {
-            self.set_mode(mode);
-        }
-        if close {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-    }
+const MAGNIFIER_CELLS: u32 = 15;
+/// Kantenlänge der Lupe in logischen Pixeln.
+const MAGNIFIER_SIZE: f32 = 120.0;
 
-    /// Lupe neben dem Mauszeiger: vergrößerte Pixel, Fadenkreuz, Position und Farbe.
-    fn magnifier(&self, painter: &egui::Painter, texture: egui::TextureId, p: Pos2, ppp: f32, full: Rect) {
-        let (w, h) = self.screen.image.dimensions();
-        let px = (p.x.floor() as i64).clamp(0, w as i64 - 1) as u32;
-        let py = (p.y.floor() as i64).clamp(0, h as i64 - 1) as u32;
-        const CELLS: f32 = 15.0;
-        let size = 120.0;
-        let cursor = pos2(p.x / ppp, p.y / ppp);
-        let mut origin = cursor + vec2(24.0, 24.0);
-        if origin.x + size > full.max.x {
-            origin.x = cursor.x - 24.0 - size;
+/// Was ein Fenster zeichnet, in seinen logischen Koordinaten.
+struct Plan {
+    full: Rect,
+    image: Arc<RenderImage>,
+    /// Ganz abdunkeln (vor der Auswahl, Freihand).
+    dim_all: bool,
+    /// Fenster unter der Maus dezent andeuten.
+    hint: Option<Rect>,
+    highlight: Option<Rect>,
+    lasso: Vec<Pos2>,
+    magnifier: Option<(Rect, Arc<RenderImage>)>,
+}
+
+fn paint_plan(p: &mut Painter, plan: &Plan) {
+    let dim = Color32::from_black_alpha(110);
+    p.image(plan.full, plan.full, &plan.image);
+    if plan.dim_all {
+        p.rect_filled(plan.full, 0.0, dim);
+    }
+    if let Some(r) = plan.hint {
+        p.rect_filled(r, 0.0, Color32::from_white_alpha(10));
+        p.rect_stroke_inside(r, 1.0, Color32::from_white_alpha(70));
+    }
+    if let Some(r) = plan.highlight {
+        let full = plan.full;
+        for part in [
+            Rect::from_min_max(full.min, pos2(full.max.x, r.min.y)),
+            Rect::from_min_max(pos2(full.min.x, r.max.y), full.max),
+            Rect::from_min_max(pos2(full.min.x, r.min.y), pos2(r.min.x, r.max.y)),
+            Rect::from_min_max(pos2(r.max.x, r.min.y), pos2(full.max.x, r.max.y)),
+        ] {
+            if part.is_positive() {
+                p.rect_filled(part.intersect(full), 0.0, dim);
+            }
         }
-        if origin.y + size + 40.0 > full.max.y {
-            origin.y = cursor.y - 24.0 - size - 40.0;
-        }
-        let rect = Rect::from_min_size(origin, vec2(size, size));
-        let half = CELLS / 2.0;
-        // UV ist relativ, gilt also auch für eine verkleinerte Textur.
-        let uv = Rect::from_min_max(
-            pos2((px as f32 + 0.5 - half) / w as f32, (py as f32 + 0.5 - half) / h as f32),
-            pos2((px as f32 + 0.5 + half) / w as f32, (py as f32 + 0.5 + half) / h as f32),
-        );
-        painter.rect_filled(rect.expand(3.0), CornerRadius::same(6), ui_kit::GROUP_BG);
-        painter.image(texture, rect, uv, Color32::WHITE);
-        let cell = size / CELLS;
+        p.rect_stroke_outside(r, 2.0, ui_kit::ACCENT);
+    }
+    if plan.lasso.len() > 1 {
+        p.line(&plan.lasso, 3.0, Color32::from_black_alpha(120));
+        p.line(&plan.lasso, 1.5, Color32::WHITE);
+    }
+    if let Some((rect, image)) = &plan.magnifier {
+        p.rect_filled(rect.expand(3.0), 6.0, ui_kit::GROUP_BG);
+        p.image(*rect, *rect, image);
+        let cell = rect.width() / MAGNIFIER_CELLS as f32;
         let center = Rect::from_center_size(rect.center(), vec2(cell, cell));
-        painter.rect_stroke(center, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Outside);
-        painter.rect_stroke(center.expand(1.0), 0.0, Stroke::new(1.0, Color32::BLACK), StrokeKind::Outside);
-
-        let [r, g, b, _] = self.screen.image.get_pixel(px, py).0;
-        let info = Rect::from_min_size(rect.left_bottom() + vec2(-3.0, 6.0), vec2(size + 6.0, 34.0));
-        painter.rect_filled(info, CornerRadius::same(6), ui_kit::GROUP_BG);
-        painter.rect_filled(
-            Rect::from_min_size(info.min + vec2(8.0, 9.0), vec2(16.0, 16.0)),
-            CornerRadius::same(3),
-            Color32::from_rgb(r, g, b),
-        );
-        let font = ui_kit::regular(11.0);
-        painter.text(info.min + vec2(30.0, 4.0), Align2::LEFT_TOP, format!("#{r:02X}{g:02X}{b:02X}"), font.clone(), ui_kit::TEXT);
-        painter.text(info.min + vec2(30.0, 18.0), Align2::LEFT_TOP, format!("{px}, {py}"), font, ui_kit::TEXT_WEAK);
+        p.rect_stroke_outside(center, 1.0, Color32::WHITE);
+        p.rect_stroke_outside(center.expand(1.0), 1.0, Color32::BLACK);
     }
 }
 
-fn size_label(painter: &egui::Painter, sel: Rect, full: Rect, text: &str) {
-    let font = ui_kit::semibold(ui_kit::SMALL_SIZE);
-    let galley = painter.layout_no_wrap(text.to_string(), font, Color32::WHITE);
-    let size = galley.size() + vec2(12.0, 6.0);
-    let mut pos = sel.left_top() - vec2(0.0, size.y + 6.0);
-    if pos.y < full.min.y + 4.0 {
-        pos.y = sel.min.y + 6.0;
-        pos.x += 6.0;
+impl Render for MonitorWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for image in self.stale_images.drain(..) {
+            ui_kit::drop_image(image, window);
+        }
+        let s = self.px_per_pt(window);
+        let viewport = window.viewport_size();
+        let full = Rect::from_min_size(Pos2::ZERO, vec2(viewport.width.as_f32(), viewport.height.as_f32()));
+        let origin = pos2(self.monitor.x as f32, self.monitor.y as f32);
+        let to_local = |p: Pos2| ((p - origin) / s).to_pos2();
+        let rect_local = |r: PxRect| Rect::from_min_size(to_local(pos2(r.x as f32, r.y as f32)), vec2(r.w as f32, r.h as f32) / s);
+
+        let shot_entity = self.shot.clone();
+        let shot = shot_entity.read(cx);
+        let cursor = shot.cursor_px();
+        // Leiste, Hinweis und Lupe nur auf dem Bildschirm mit der Maus.
+        let here = cursor.is_some_and(|p| self.monitor.contains(p.x, p.y))
+            || (cursor.is_none() && shot.screen.monitors.first().is_none_or(|m| *m == self.monitor));
+        let mode = shot.mode;
+
+        let mut plan = Plan {
+            full,
+            image: self.image.clone(),
+            dim_all: false,
+            hint: None,
+            highlight: None,
+            lasso: Vec::new(),
+            magnifier: None,
+        };
+        let mut size_label: Option<(Rect, String)> = None;
+        let mut magnifier = false;
+        match mode {
+            CaptureMode::Rect => {
+                match shot.selection() {
+                    Some(sel) if shot.pressed => {
+                        plan.highlight = Some(rect_local(sel));
+                        size_label = Some((rect_local(sel), format!("{} × {}", sel.w, sel.h)));
+                    }
+                    _ => {
+                        plan.dim_all = true;
+                        // Vor dem Ziehen: das Fenster unter der Maus dezent andeuten.
+                        if let Some(win) = cursor.and_then(|p| shot.window_at(p)) {
+                            plan.hint = Some(rect_local(win));
+                        }
+                    }
+                }
+                magnifier = true;
+            }
+            CaptureMode::Window | CaptureMode::Screen => {
+                let target = cursor.and_then(|p| {
+                    if mode == CaptureMode::Window {
+                        shot.window_at(p)
+                    } else {
+                        shot.monitor_at(p)
+                    }
+                });
+                match target {
+                    Some(t) => {
+                        plan.highlight = Some(rect_local(t));
+                        size_label = Some((rect_local(t), format!("{} × {}", t.w, t.h)));
+                    }
+                    None => plan.dim_all = true,
+                }
+            }
+            CaptureMode::Freeform => {
+                plan.dim_all = true;
+                plan.lasso = shot.lasso.iter().map(|p| to_local(*p)).collect();
+                magnifier = true;
+            }
+        }
+
+        // Lupe neben dem Mauszeiger: vergrößerte Pixel, Fadenkreuz, Position und Farbe.
+        let mut magnifier_info: Option<(Pos2, String, String, Color32)> = None;
+        if let (true, true, Some(p)) = (magnifier, here, cursor) {
+            let (w, h) = shot.screen.image.dimensions();
+            let px = ((p.x.floor() as i64).clamp(0, w as i64 - 1) as u32, (p.y.floor() as i64).clamp(0, h as i64 - 1) as u32);
+            let [r, g, b, _] = shot.screen.image.get_pixel(px.0, px.1).0;
+            let cursor_local = to_local(p);
+            let mut origin = cursor_local + vec2(24.0, 24.0);
+            if origin.x + MAGNIFIER_SIZE > full.max.x {
+                origin.x = cursor_local.x - 24.0 - MAGNIFIER_SIZE;
+            }
+            if origin.y + MAGNIFIER_SIZE + 40.0 > full.max.y {
+                origin.y = cursor_local.y - 24.0 - MAGNIFIER_SIZE - 40.0;
+            }
+            let rect = Rect::from_min_size(origin, vec2(MAGNIFIER_SIZE, MAGNIFIER_SIZE));
+            let shot_ref = self.shot.clone();
+            let image = self.magnifier_image(shot_ref.read(cx), px, s);
+            plan.magnifier = Some((rect, image));
+            magnifier_info = Some((
+                rect.left_bottom() + vec2(-3.0, 6.0),
+                format!("#{r:02X}{g:02X}{b:02X}"),
+                format!("{}, {}", px.0, px.1),
+                Color32::from_rgb(r, g, b),
+            ));
+        }
+
+        let this = cx.entity();
+        let surface = canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |_, hitbox, window, cx| {
+                window.set_cursor_style(CursorStyle::Crosshair, &hitbox);
+                let shot = this.read(cx).shot.clone();
+                let hb = hitbox.clone();
+                let s1 = shot.clone();
+                window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble && e.button == MouseButton::Left && hb.is_hovered(window) {
+                        s1.update(cx, |shot, cx| {
+                            shot.press();
+                            cx.notify();
+                        });
+                    }
+                });
+                let s2 = shot.clone();
+                window.on_mouse_event(move |_: &MouseMoveEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        s2.update(cx, |shot, cx| {
+                            shot.moved();
+                            cx.notify();
+                        });
+                    }
+                });
+                let s3 = shot.clone();
+                window.on_mouse_event(move |e: &MouseUpEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble && e.button == MouseButton::Left {
+                        s3.update(cx, |shot, cx| {
+                            shot.release(cx);
+                            cx.notify();
+                        });
+                    }
+                });
+                paint_plan(&mut Painter::new(window), &plan);
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+
+        let label = size_label.map(|(sel, label)| {
+            let mut pos = sel.left_top() - vec2(0.0, 26.0);
+            if pos.y < 4.0 {
+                pos = sel.left_top() + vec2(6.0, 6.0);
+            }
+            div()
+                .absolute()
+                .left(px(pos.x))
+                .top(px(pos.y))
+                .px(px(6.0))
+                .py(px(3.0))
+                .rounded(px(5.0))
+                .bg(Color32::from_black_alpha(190))
+                .child(text(label, ui_kit::SMALL_SIZE, Color32::WHITE).font_weight(FontWeight::SEMIBOLD))
+        });
+        let info = magnifier_info.map(|(at, hex, pos, color)| {
+            h_flex()
+                .absolute()
+                .left(px(at.x))
+                .top(px(at.y))
+                .w(px(MAGNIFIER_SIZE + 6.0))
+                .h(px(34.0))
+                .px(px(8.0))
+                .gap(px(6.0))
+                .rounded(px(6.0))
+                .bg(ui_kit::GROUP_BG)
+                .child(div().size(px(16.0)).rounded(px(3.0)).bg(color))
+                .child(
+                    v_flex()
+                        .child(text(hex, 11.0, ui_kit::TEXT))
+                        .child(text(pos, 11.0, ui_kit::TEXT_WEAK)),
+                )
+        });
+        let toolbar = here.then(|| self.toolbar(mode, cx));
+
+        div()
+            .id("auswahl")
+            .size_full()
+            .relative()
+            .bg(Color32::BLACK)
+            .font_family(ui_kit::FONT)
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let key = event.keystroke.key.clone();
+                this.shot.update(cx, |shot, cx| {
+                    shot.key(&key, cx);
+                    cx.notify();
+                });
+            }))
+            .child(surface)
+            .children(label)
+            .children(info)
+            .children(toolbar)
     }
-    let bg = Rect::from_min_size(pos, size);
-    painter.rect_filled(bg, CornerRadius::same(5), Color32::from_black_alpha(190));
-    painter.galley(bg.min + vec2(6.0, 3.0), galley, Color32::WHITE);
 }
 
-/// Lädt ein Bild als Textur und verkleinert es, falls es die Grafikkarte nicht schafft.
-/// Gibt auch den Faktor zurück (1.0 = Originalgröße).
-pub fn upload(ctx: &egui::Context, name: &str, image: &RgbaImage, max_side: u32) -> (egui::TextureHandle, f32) {
-    let (w, h) = image.dimensions();
-    let longest = w.max(h).max(1);
-    let options = egui::TextureOptions {
-        magnification: egui::TextureFilter::Nearest,
-        minification: egui::TextureFilter::Linear,
-        ..Default::default()
-    };
-    if longest <= max_side {
-        let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], image.as_raw());
-        return (ctx.load_texture(name, color, options), 1.0);
+impl MonitorWindow {
+    /// Leiste oben mittig zum Umschalten der Aufnahmeart, darunter eine Bedienhilfe.
+    fn toolbar(&self, mode: CaptureMode, cx: &mut Context<Self>) -> impl IntoElement {
+        let modes = CaptureMode::ALL.into_iter().map(|m| {
+            icons::button(m.id(), m.glyph(), mode == m, true, m.label()).on_click(cx.listener(
+                move |this, _: &ClickEvent, _, cx| {
+                    this.shot.update(cx, |shot, cx| {
+                        shot.set_mode(m);
+                        cx.notify();
+                    });
+                },
+            ))
+        });
+        v_flex()
+            .absolute()
+            .top(px(14.0))
+            .left_0()
+            .w_full()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                h_flex()
+                    .occlude()
+                    .gap(px(2.0))
+                    .p(px(5.0))
+                    .rounded(px(10.0))
+                    .bg(ui_kit::GROUP_BG)
+                    .border_1()
+                    .border_color(ui_kit::DIVIDER)
+                    .shadow_lg()
+                    .children(modes)
+                    .child(ui_kit::vertical_divider())
+                    .child(
+                        icons::button("abbrechen", Glyph::Close, false, true, "Abbrechen (Esc)")
+                            .on_click(|_, _, cx| cx.quit()),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(12.0))
+                    .py(px(5.0))
+                    .rounded(px(12.0))
+                    .bg(Color32::from_black_alpha(170))
+                    .child(text(mode.hint(), ui_kit::SMALL_SIZE, Color32::WHITE)),
+            )
     }
-    let scale = max_side as f32 / longest as f32;
-    let (nw, nh) = (((w as f32 * scale) as u32).max(1), ((h as f32 * scale) as u32).max(1));
-    let small = image::imageops::resize(image, nw, nh, image::imageops::FilterType::Triangle);
-    let color = egui::ColorImage::from_rgba_unmultiplied([nw as usize, nh as usize], small.as_raw());
-    (ctx.load_texture(name, color, options), scale)
 }

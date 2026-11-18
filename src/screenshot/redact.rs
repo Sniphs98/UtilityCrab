@@ -4,7 +4,7 @@
 //! Ein neues Muster = ein Eintrag in [`PATTERNS`]. Es erscheint dann automatisch im Menü
 //! „Sensible Daten unkenntlich machen“ und wird gemerkt.
 
-use eframe::egui::{pos2, Rect};
+use crate::geom::{pos2, vec2, Rect};
 use regex::Regex;
 
 use crate::ocr::Word;
@@ -109,7 +109,7 @@ pub fn find(lines: &[Vec<Word>], enabled: &[String]) -> Vec<Found> {
                 let rects: Vec<Rect> = spans
                     .iter()
                     .filter(|(s, e, _)| *s < m.end() && *e > m.start())
-                    .map(|(_, _, [x, y, w, h])| Rect::from_min_size(pos2(*x, *y), eframe::egui::vec2(*w, *h)))
+                    .map(|(_, _, [x, y, w, h])| Rect::from_min_size(pos2(*x, *y), vec2(*w, *h)))
                     .collect();
                 if let Some(first) = rects.first() {
                     let union = rects.iter().fold(*first, |a, b| a.union(*b));

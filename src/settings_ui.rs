@@ -1,45 +1,32 @@
-//! Einstellungsdialog (egui) im Stil der macOS-Systemeinstellungen: Seitenleiste links,
-//! rechts Seiten aus gruppierten Zeilen. Läuft als eigener Prozess, damit das Tray-Programm
-//! mit seinen Tastenkürzeln davon unberührt bleibt. Änderungen werden sofort gespeichert.
+//! Einstellungsdialog (GPUI + GPUI Kit) im Stil der macOS-Systemeinstellungen: Seitenleiste
+//! links, rechts Seiten aus gruppierten Zeilen. Läuft als eigener Prozess, damit das
+//! Tray-Programm mit seinen Tastenkürzeln davon unberührt bleibt. Änderungen werden sofort
+//! gespeichert.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use eframe::egui::{self, vec2, Color32, RichText};
 use global_hotkey::hotkey::HotKey;
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::progress::Progress;
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::switch::Switch;
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
 
-use crate::icon;
+use crate::geom::Color32;
 use crate::settings::{hotkey_label, Notify, Pronunciation, Settings};
 use crate::tts::{self, Package, VoiceInfo};
-use crate::update;
 use crate::ui_kit::{
-    self, danger_button, keycaps, nav_item, page_header, primary_button, regular, section, semibold, toggle, NavIcon,
-    SIDEBAR_BG, SMALL_SIZE, TEXT, TEXT_FAINT, TEXT_WEAK,
+    self, button, choice, custom, danger_button, error_banner, h_flex, keycaps, nav_item, page_header, primary_button,
+    section, strong, text, v_flex, NavIcon, ACCENT, BODY_SIZE, GREEN, SIDEBAR_BG, SMALL_SIZE,
+    TEXT, TEXT_FAINT, TEXT_WEAK,
 };
-
-// Für die anderen Fenster (Konverter, Popup), die das gemeinsame Aussehen nutzen.
-pub use ui_kit::ACCENT;
-pub const PAGE_BG: Color32 = ui_kit::CONTENT_BG;
-pub const CARD_BG: Color32 = ui_kit::GROUP_BG;
-
-/// Gemeinsames Aussehen aller Fenster (Einstellungen, Konverter, Popup).
-pub fn apply_theme(ctx: &egui::Context) {
-    ui_kit::apply(ctx);
-}
-
-pub fn accent_button(text: &str) -> egui::Button<'_> {
-    primary_button(text)
-}
-
-pub fn window_icon() -> egui::IconData {
-    egui::IconData {
-        rgba: icon::crab_rgba(),
-        width: icon::SIZE,
-        height: icon::SIZE,
-    }
-}
+use crate::update;
 
 /// Öffnet das Fenster; `tab` (z. B. „modelle“) wählt die Startseite.
 pub fn run(tab: Option<&str>) {
@@ -47,22 +34,10 @@ pub fn run(tab: Option<&str>) {
         .into_iter()
         .find(|t| Some(t.id()) == tab)
         .unwrap_or(Tab::Voice);
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("UtilityCrab – Einstellungen")
-            .with_inner_size([820.0, 580.0])
-            .with_min_inner_size([680.0, 460.0])
-            .with_icon(window_icon()),
-        ..Default::default()
-    };
-    let result = eframe::run_native(
-        "UtilityCrab",
-        options,
-        Box::new(move |cc| Ok(Box::new(SettingsApp::new(cc, start)))),
-    );
-    if let Err(e) = result {
-        crate::report(Err(format!("Einstellungsfenster: {e}")));
-    }
+    ui_kit::run_app(move |cx| {
+        let options = ui_kit::window_options("UtilityCrab – Einstellungen", (820.0, 580.0), (680.0, 460.0), cx);
+        ui_kit::open_window(options, cx, move |window, cx| cx.new(|cx| SettingsApp::new(start, window, cx)));
+    });
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -118,7 +93,7 @@ impl Tab {
             Tab::Pronunciation => (NavIcon::Text, Color32::from_rgb(0x22, 0xA5, 0x5B)),
             Tab::Hotkeys => (NavIcon::Keyboard, Color32::from_rgb(0x6B, 0x72, 0x80)),
             Tab::Screenshot => (NavIcon::Camera, Color32::from_rgb(0xD9, 0x46, 0x6F)),
-            Tab::Convert => (NavIcon::Convert, ui_kit::ACCENT),
+            Tab::Convert => (NavIcon::Convert, ACCENT),
             Tab::About => (NavIcon::Info, Color32::from_rgb(0x0E, 0x9F, 0xB5)),
         }
     }
@@ -150,37 +125,90 @@ enum UpdateState {
 /// Laufende Downloads, Schlüssel "provider/paket".
 type Downloads = Arc<Mutex<HashMap<String, DownloadState>>>;
 
+/// Zwei Textfelder je Ausspracheeintrag: Wort → so sprechen.
+struct PronunciationRow {
+    word: Entity<InputState>,
+    spoken: Entity<InputState>,
+}
+
 struct SettingsApp {
     tab: Tab,
     settings: Settings,
     saved: Settings,
     speaker: tts::Speaker,
-    sample_text: String,
     downloads: Downloads,
     /// Pakete und Stimmen je Provider; neu eingelesen nach Download oder Löschen.
     catalog: Vec<(&'static str, Vec<Package>, Vec<VoiceInfo>)>,
     confirm_delete: Option<String>,
     capture: Option<HotkeyTarget>,
     message: Option<String>,
-    crab: egui::TextureHandle,
+    crab: Arc<RenderImage>,
     update: Arc<Mutex<UpdateState>>,
+    focus: FocusHandle,
+    sample_text: Entity<TextareaState>,
+    speed: Entity<SliderState>,
+    snip_folder: Entity<InputState>,
+    pronunciation_rows: Vec<PronunciationRow>,
+    pronunciation_subscriptions: Vec<Subscription>,
+    was_busy: bool,
+    _subscriptions: Vec<Subscription>,
+    _poll: Task<()>,
 }
 
 impl SettingsApp {
-    fn new(cc: &eframe::CreationContext, tab: Tab) -> Self {
-        apply_theme(&cc.egui_ctx);
-        let crab = cc.egui_ctx.load_texture(
-            "krabbe",
-            egui::ColorImage::from_rgba_unmultiplied([64, 64], &crate::crab_pixels::crab_rgba(64)),
-            egui::TextureOptions::LINEAR,
-        );
+    fn new(tab: Tab, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let crab = image::RgbaImage::from_raw(64, 64, crate::crab_pixels::crab_rgba(64))
+            .map(|img| ui_kit::render_image(&img))
+            .unwrap_or_else(|| ui_kit::render_image(&image::RgbaImage::new(1, 1)));
         let settings = Settings::load();
+
+        let sample_text = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(2)
+                .default_value("Hallo! So klingt diese Stimme. Ist das privat oder öffentlich?")
+        });
+        let speed = cx.new(|_| {
+            SliderState::new()
+                .min(0.5)
+                .max(2.0)
+                .step(0.05)
+                .default_value(settings.speed)
+        });
+        let default_folder = crate::screenshot::default_folder();
+        let snip_folder = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(format!("{} (Standard)", default_folder.display()))
+                .default_value(settings.snip_folder.clone())
+        });
+
+        let subscriptions = vec![
+            cx.subscribe_in(&speed, window, |this, _, event: &SliderEvent, _, cx| {
+                if let SliderEvent::Change(value) = event {
+                    this.settings.speed = (value.end() * 20.0).round() / 20.0;
+                    this.save(cx);
+                }
+            }),
+            cx.subscribe_in(&snip_folder, window, |this, state, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.settings.snip_folder = state.read(cx).value().to_string();
+                    this.save(cx);
+                }
+            }),
+        ];
+
+        // Fortschritt, Abspielknopf und Update-Suche aktuell halten.
+        let poll = cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(200)).await;
+            if this.update_in(cx, |this, _, cx| this.poll(cx)).is_err() {
+                break;
+            }
+        });
+
         let mut app = Self {
             tab,
             saved: settings.clone(),
             settings,
             speaker: tts::Speaker::new(),
-            sample_text: "Hallo! So klingt diese Stimme. Ist das privat oder öffentlich?".into(),
             downloads: Downloads::default(),
             catalog: Vec::new(),
             confirm_delete: None,
@@ -188,33 +216,22 @@ impl SettingsApp {
             message: None,
             crab,
             update: Arc::new(Mutex::new(UpdateState::Idle)),
+            focus: cx.focus_handle(),
+            sample_text,
+            speed,
+            snip_folder,
+            pronunciation_rows: Vec::new(),
+            pronunciation_subscriptions: Vec::new(),
+            was_busy: false,
+            _subscriptions: subscriptions,
+            _poll: poll,
         };
         app.refresh_catalog();
+        app.rebuild_pronunciation_rows(window, cx);
         app
     }
 
-    fn refresh_catalog(&mut self) {
-        self.catalog = tts::providers()
-            .iter()
-            .map(|p| (p.id(), p.packages(), p.voices()))
-            .collect();
-    }
-
-    fn voices_of(&self, provider: &str) -> &[VoiceInfo] {
-        self.catalog
-            .iter()
-            .find(|(id, ..)| *id == provider)
-            .map(|(_, _, voices)| voices.as_slice())
-            .unwrap_or_default()
-    }
-
-    fn speak(&mut self, text: &str) {
-        self.message = self.speaker.speak(text, &self.settings).err();
-    }
-}
-
-impl eframe::App for SettingsApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn poll(&mut self, cx: &mut Context<Self>) {
         // Abgeschlossene Downloads übernehmen.
         let finished: Vec<(String, Option<String>)> = {
             let downloads = self.downloads.lock().unwrap();
@@ -237,284 +254,413 @@ impl eframe::App for SettingsApp {
             }
             drop(downloads);
             self.refresh_catalog();
+            cx.notify();
         }
+        let busy = !self.downloads.lock().unwrap().is_empty()
+            || self.speaker.is_speaking()
+            || matches!(*self.update.lock().unwrap(), UpdateState::Checking);
+        if busy || self.was_busy {
+            cx.notify();
+        }
+        self.was_busy = busy;
+    }
 
-        egui::Panel::left("navigation")
-            .exact_size(210.0)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(egui::Frame::new().fill(SIDEBAR_BG).inner_margin(egui::Margin::symmetric(10, 0)))
-            .show(ui, |ui| self.navigation(ui));
-
-        let page = egui::Frame::new()
-            .fill(ui_kit::CONTENT_BG)
-            .inner_margin(egui::Margin { left: 28, right: 22, top: 22, bottom: 12 });
-        egui::CentralPanel::default().frame(page).show(ui, |ui| {
-            // Breite vorher festlegen: in der ScrollArea wäre sie sonst nicht begrenzt.
-            let width = ui.available_width().min(620.0);
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.set_width(width);
-                if let Some(message) = self.message.clone() {
-                    ui_kit::error_banner(ui, &message);
-                    ui.add_space(14.0);
-                }
-                match self.tab {
-                    Tab::Voice => self.voice_tab(ui),
-                    Tab::Models => self.models_tab(ui),
-                    Tab::Pronunciation => self.pronunciation_tab(ui),
-                    Tab::Hotkeys => self.hotkeys_tab(ui),
-                    Tab::Screenshot => self.screenshot_tab(ui),
-                    Tab::Convert => self.convert_tab(ui),
-                    Tab::About => self.about_tab(ui),
-                }
-            });
-        });
-
+    /// Speichert, falls sich etwas geändert hat, und zeichnet neu.
+    fn save(&mut self, cx: &mut Context<Self>) {
         if self.settings != self.saved {
             match self.settings.save() {
                 Ok(()) => self.saved = self.settings.clone(),
                 Err(e) => self.message = Some(e),
             }
         }
+        cx.notify();
+    }
 
-        // Fortschritt und Abspielknopf aktuell halten.
-        let busy = !self.downloads.lock().unwrap().is_empty()
-            || self.speaker.is_speaking()
-            || matches!(*self.update.lock().unwrap(), UpdateState::Checking);
-        if busy {
-            ui.ctx().request_repaint_after(Duration::from_millis(200));
+    fn refresh_catalog(&mut self) {
+        self.catalog = tts::providers()
+            .iter()
+            .map(|p| (p.id(), p.packages(), p.voices()))
+            .collect();
+    }
+
+    fn voices_of(&self, provider: &str) -> &[VoiceInfo] {
+        self.catalog
+            .iter()
+            .find(|(id, ..)| *id == provider)
+            .map(|(_, _, voices)| voices.as_slice())
+            .unwrap_or_default()
+    }
+
+    fn speak(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.message = self.speaker.speak(text, &self.settings).err();
+        cx.notify();
+    }
+
+    fn select_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        self.tab = tab;
+        self.capture = None;
+        self.message = None;
+        cx.notify();
+    }
+
+    /// Schalter, der ein Feld der Einstellungen setzt und sofort speichert.
+    fn switch(&self, id: &'static str, checked: bool, set: fn(&mut Settings, bool), cx: &mut Context<Self>) -> Switch {
+        Switch::new(id).checked(checked).on_click(cx.listener(move |this, on: &bool, _, cx| {
+            set(&mut this.settings, *on);
+            this.save(cx);
+        }))
+    }
+
+    /// Textfelder für die Ausspracheeinträge neu anlegen (nach Hinzufügen/Entfernen).
+    fn rebuild_pronunciation_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pronunciation_rows.clear();
+        self.pronunciation_subscriptions.clear();
+        for (index, entry) in self.settings.pronunciations.iter().enumerate() {
+            let word = cx.new(|cx| InputState::new(window, cx).placeholder("Wort").default_value(entry.word.clone()));
+            let spoken = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("So sprechen")
+                    .default_value(entry.spoken.clone())
+            });
+            for (input, is_word) in [(&word, true), (&spoken, false)] {
+                self.pronunciation_subscriptions.push(cx.subscribe_in(
+                    input,
+                    window,
+                    move |this, state, event: &InputEvent, _, cx| {
+                        if !matches!(event, InputEvent::Change) {
+                            return;
+                        }
+                        let value = state.read(cx).value().to_string();
+                        if let Some(entry) = this.settings.pronunciations.get_mut(index) {
+                            if is_word {
+                                entry.word = value;
+                            } else {
+                                entry.spoken = value;
+                            }
+                            this.save(cx);
+                        }
+                    },
+                ));
+            }
+            self.pronunciation_rows.push(PronunciationRow { word, spoken });
         }
+    }
+
+    /// Tastendruck während „Tasten drücken …“.
+    fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(target) = self.capture else {
+            return;
+        };
+        match capture_hotkey(&event.keystroke) {
+            None => return,
+            Some(Ok(hotkey)) => {
+                match target {
+                    HotkeyTarget::Speak => self.settings.hotkey_speak = hotkey,
+                    HotkeyTarget::Ocr => self.settings.hotkey_ocr = hotkey,
+                    HotkeyTarget::Snip => self.settings.hotkey_snip = hotkey,
+                }
+                self.message = None;
+                self.capture = None;
+            }
+            Some(Err(Some(e))) => self.message = Some(e),
+            Some(Err(None)) => self.capture = None,
+        }
+        cx.stop_propagation();
+        self.save(cx);
+    }
+}
+
+impl Render for SettingsApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let page: AnyElement = match self.tab {
+            Tab::Voice => self.voice_tab(cx).into_any_element(),
+            Tab::Models => self.models_tab(cx).into_any_element(),
+            Tab::Pronunciation => self.pronunciation_tab(window, cx).into_any_element(),
+            Tab::Hotkeys => self.hotkeys_tab(window, cx).into_any_element(),
+            Tab::Screenshot => self.screenshot_tab(cx).into_any_element(),
+            Tab::Convert => self.convert_tab(cx).into_any_element(),
+            Tab::About => self.about_tab(cx).into_any_element(),
+        };
+        h_flex()
+            .id("einstellungen")
+            .size_full()
+            .items_start()
+            .font_family(ui_kit::FONT)
+            .text_size(px(BODY_SIZE))
+            .text_color(TEXT)
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.on_key(event, cx)))
+            .child(self.navigation(cx))
+            .child(
+                div()
+                    .id("seite")
+                    .flex_1()
+                    .h_full()
+                    .bg(ui_kit::CONTENT_BG)
+                    .overflow_y_scroll()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .max_w(px(620.0))
+                            .pl(px(28.0))
+                            .pr(px(22.0))
+                            .pt(px(22.0))
+                            .pb(px(12.0))
+                            .when_some(self.message.clone(), |el, message| el.child(error_banner(&message).mb(px(14.0))))
+                            .child(page),
+                    ),
+            )
     }
 }
 
 impl SettingsApp {
-    fn navigation(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(18.0);
-        ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            ui.add(egui::Image::new(&self.crab).fit_to_exact_size(vec2(30.0, 30.0)));
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(RichText::new("UtilityCrab").font(semibold(15.0)).color(TEXT));
-                ui.label(RichText::new("Einstellungen").font(regular(SMALL_SIZE)).color(TEXT_WEAK));
-            });
-        });
-        ui.add_space(18.0);
-
-        ui.spacing_mut().item_spacing.y = 2.0;
-        for tab in Tab::ALL {
-            let (icon, color) = tab.icon();
-            if nav_item(ui, self.tab == tab, icon, color, tab.label()) {
-                self.tab = tab;
-                self.capture = None;
-                self.message = None;
-            }
-        }
-
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(14.0);
-            ui.horizontal(|ui| {
-                ui.add_space(6.0);
-                ui.add(
-                    egui::Label::new(RichText::new("Änderungen werden sofort gespeichert.").font(regular(11.5)).color(TEXT_FAINT))
-                        .wrap(),
-                );
-            });
-        });
+    fn navigation(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .w(px(210.0))
+            .flex_none()
+            .h_full()
+            .bg(SIDEBAR_BG)
+            .px(px(10.0))
+            .child(
+                h_flex()
+                    .mt(px(18.0))
+                    .mb(px(18.0))
+                    .pl(px(4.0))
+                    .gap(px(8.0))
+                    .child(img(self.crab.clone()).size(px(30.0)))
+                    .child(
+                        v_flex()
+                            .child(strong("UtilityCrab", 15.0, TEXT))
+                            .child(text("Einstellungen", SMALL_SIZE, TEXT_WEAK)),
+                    ),
+            )
+            .child(v_flex().gap(px(2.0)).children(Tab::ALL.into_iter().map(|tab| {
+                let (icon, color) = tab.icon();
+                nav_item(
+                    tab.id(),
+                    self.tab == tab,
+                    icon,
+                    color,
+                    tab.label(),
+                    cx.listener(move |this, _: &ClickEvent, _, cx| this.select_tab(tab, cx)),
+                )
+            })))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .px(px(6.0))
+                    .pb(px(14.0))
+                    .child(text("Änderungen werden sofort gespeichert.", 11.5, TEXT_FAINT)),
+            )
     }
 
-    fn voice_tab(&mut self, ui: &mut egui::Ui) {
-        page_header(ui, "Stimme", "Mit welcher Stimme markierter Text vorgelesen wird.");
-
-        let mut go_to_models = false;
+    fn voice_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let voices = self.voices_of(&self.settings.provider).to_vec();
         let providers: Vec<(&'static str, &'static str, bool)> = tts::providers()
             .iter()
             .map(|p| (p.id(), p.name(), !self.voices_of(p.id()).is_empty()))
             .collect();
-        section(ui, None, None, |g| {
-            g.row("Engine", None, |ui| {
-                let current = providers
-                    .iter()
-                    .find(|(id, ..)| *id == self.settings.provider)
-                    .map(|(_, name, _)| *name)
-                    .unwrap_or("–");
-                egui::ComboBox::from_id_salt("provider")
-                    .selected_text(current)
-                    .width(230.0)
-                    .show_ui(ui, |ui| {
-                        for (id, name, installed) in &providers {
-                            let label = if *installed {
-                                name.to_string()
-                            } else {
-                                format!("{name} (nicht installiert)")
-                            };
-                            if ui.selectable_label(self.settings.provider == *id, label).clicked() {
-                                self.settings.provider = id.to_string();
-                                self.settings.voice = String::new();
-                            }
-                        }
-                    });
-            });
-            g.row("Stimme", None, |ui| {
-                if voices.is_empty() {
-                    if ui.button("Modelle laden …").clicked() {
-                        go_to_models = true;
-                    }
-                    ui.label(RichText::new("Noch keine installiert").color(TEXT_WEAK));
-                } else {
-                    let current = voices
-                        .iter()
-                        .find(|v| v.id == self.settings.voice)
-                        .unwrap_or(&voices[0]);
-                    let mut selected = current.id.clone();
-                    egui::ComboBox::from_id_salt("voice")
-                        .selected_text(&current.name)
-                        .width(230.0)
-                        .show_ui(ui, |ui| {
-                            for voice in &voices {
-                                ui.selectable_value(&mut selected, voice.id.clone(), &voice.name);
-                            }
-                        });
-                    if selected != self.settings.voice {
-                        self.settings.voice = selected;
-                    }
-                }
-            });
-            g.row("Tempo", None, |ui| {
-                ui.spacing_mut().slider_width = 180.0;
-                ui.add(
-                    egui::Slider::new(&mut self.settings.speed, 0.5..=2.0)
-                        .step_by(0.05)
-                        .fixed_decimals(2)
-                        .suffix("×"),
-                );
-            });
-            g.row(
-                "Sprache automatisch erkennen",
-                Some("Wechselt pro Satz zu einer installierten Stimme der erkannten Sprache, z. B. für einen englischen Satz."),
-                |ui| {
-                    toggle(ui, &mut self.settings.auto_language);
-                },
-            );
-        });
-        if go_to_models {
-            self.tab = Tab::Models;
-        }
+        let view = cx.entity().downgrade();
 
-        let mut play = false;
-        let speaking = self.speaker.is_speaking();
-        section(ui, Some("Probehören"), None, |g| {
-            g.custom(|ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.sample_text)
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.horizontal(|ui| {
-                    let clicked = if speaking {
-                        ui.button("Stopp").clicked()
+        let current_provider = providers
+            .iter()
+            .find(|(id, ..)| *id == self.settings.provider)
+            .map(|(_, name, _)| *name)
+            .unwrap_or("–");
+        let provider_menu = button("provider", current_provider).dropdown_caret(true).dropdown_menu({
+            let view = view.clone();
+            let selected = self.settings.provider.clone();
+            move |mut menu, _, _| {
+                for (id, name, installed) in &providers {
+                    let label = if *installed {
+                        name.to_string()
                     } else {
-                        ui.add(primary_button("Probe hören")).clicked()
+                        format!("{name} (nicht installiert)")
                     };
-                    play = clicked;
-                });
-            });
-        });
-        if play {
-            if speaking {
-                self.speaker.stop();
-            } else {
-                let text = self.sample_text.clone();
-                self.speak(&text);
+                    let view = view.clone();
+                    let id = *id;
+                    menu = menu.item(PopupMenuItem::new(label).checked(selected == id).on_click(move |_, _, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.settings.provider = id.to_string();
+                            this.settings.voice = String::new();
+                            this.save(cx);
+                        });
+                    }));
+                }
+                menu
             }
+        });
+
+        let voice_control: AnyElement = if voices.is_empty() {
+            h_flex()
+                .gap(px(8.0))
+                .child(text("Noch keine installiert", BODY_SIZE, TEXT_WEAK))
+                .child(
+                    button("modelle-laden", "Modelle laden …")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.select_tab(Tab::Models, cx))),
+                )
+                .into_any_element()
+        } else {
+            let current = voices
+                .iter()
+                .find(|v| v.id == self.settings.voice)
+                .unwrap_or(&voices[0])
+                .clone();
+            button("stimme", current.name.clone())
+                .dropdown_caret(true)
+                .dropdown_menu(move |mut menu, _, _| {
+                    for voice in &voices {
+                        let view = view.clone();
+                        let id = voice.id.clone();
+                        menu = menu.item(PopupMenuItem::new(voice.name.clone()).checked(voice.id == current.id).on_click(
+                            move |_, _, cx| {
+                                let id = id.clone();
+                                let _ = view.update(cx, |this, cx| {
+                                    this.settings.voice = id;
+                                    this.save(cx);
+                                });
+                            },
+                        ));
+                    }
+                    menu
+                })
+                .into_any_element()
+        };
+
+        let speaking = self.speaker.is_speaking();
+        let play = if speaking {
+            button("probe", "Stopp")
+        } else {
+            primary_button("probe", "Probe hören")
         }
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            if this.speaker.is_speaking() {
+                this.speaker.stop();
+                cx.notify();
+            } else {
+                let text = this.sample_text.read(cx).value().to_string();
+                this.speak(&text, cx);
+            }
+        }));
+
+        v_flex()
+            .child(page_header("Stimme", "Mit welcher Stimme markierter Text vorgelesen wird."))
+            .child(
+                section()
+                    .row("Engine", None, provider_menu)
+                    .row("Stimme", None, voice_control)
+                    .row(
+                        "Tempo",
+                        None,
+                        h_flex()
+                            .gap(px(10.0))
+                            .child(div().w(px(180.0)).child(Slider::new(&self.speed)))
+                            .child(strong(format!("{:.2}×", self.settings.speed), BODY_SIZE, TEXT).w(px(44.0))),
+                    )
+                    .row(
+                        "Sprache automatisch erkennen",
+                        Some("Wechselt pro Satz zu einer installierten Stimme der erkannten Sprache, z. B. für einen englischen Satz."),
+                        self.switch("auto-sprache", self.settings.auto_language, |s, v| s.auto_language = v, cx),
+                    ),
+            )
+            .child(
+                section()
+                    .title("Probehören")
+                    .child(custom(v_flex().gap(px(8.0)).child(Textarea::new(&self.sample_text)).child(h_flex().child(play)))),
+            )
     }
 
-    fn models_tab(&mut self, ui: &mut egui::Ui) {
-        page_header(
-            ui,
+    fn models_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let downloads = self.downloads.lock().unwrap();
+        let mut page = v_flex().child(page_header(
             "Modelle",
             "Stimmen-Modelle herunterladen oder löschen. Alles läuft lokal, kein Text verlässt den PC.",
-        );
-
-        let mut start_download = None;
-        let mut delete = None;
-        let mut confirm = self.confirm_delete.clone();
-        {
-            let downloads = self.downloads.lock().unwrap();
-            for provider in tts::providers() {
-                let (packages, voices) = self
-                    .catalog
-                    .iter()
-                    .find(|(id, ..)| *id == provider.id())
-                    .map(|(_, p, v)| (p, v))
-                    .expect("Katalog unvollständig");
-
-                section(ui, Some(provider.name()), Some(provider.description()), |g| {
-                    if packages.is_empty() {
-                        g.row(
-                            "Keine Installation nötig",
-                            Some(&format!("{} Stimmen verfügbar", voices.len())),
-                            |ui| {
-                                ui.label(RichText::new("Bereit").color(ui_kit::GREEN));
-                            },
-                        );
-                        return;
-                    }
-                    for package in packages {
-                        let key = format!("{}/{}", provider.id(), package.id);
-                        let size = format!("{} MB", package.size_mb);
-                        g.row(&package.name, Some(&size), |ui| match downloads.get(&key) {
-                            Some(DownloadState::Running(progress)) => {
-                                ui.add(egui::ProgressBar::new(*progress).desired_width(150.0).show_percentage());
-                            }
-                            _ if package.installed => {
-                                if confirm.as_deref() == Some(key.as_str()) {
-                                    if ui.button("Abbrechen").clicked() {
-                                        confirm = None;
-                                    }
-                                    if ui.add(danger_button("Löschen")).clicked() {
-                                        delete = Some((provider.id(), package.id.clone()));
-                                    }
-                                } else {
-                                    if ui.button("Löschen").clicked() {
-                                        confirm = Some(key.clone());
-                                    }
-                                    ui.label(RichText::new("Installiert").color(ui_kit::GREEN));
-                                }
-                            }
-                            _ => {
-                                if ui.add(primary_button("Laden")).clicked() {
-                                    start_download = Some((provider.id(), package.id.clone()));
-                                }
-                            }
-                        });
-                    }
-                });
+        ));
+        for provider in tts::providers() {
+            let Some((packages, voices)) = self
+                .catalog
+                .iter()
+                .find(|(id, ..)| *id == provider.id())
+                .map(|(_, p, v)| (p, v))
+            else {
+                continue;
+            };
+            let mut group = section().title(provider.name()).footnote(provider.description());
+            if packages.is_empty() {
+                group = group.row(
+                    "Keine Installation nötig",
+                    Some(&format!("{} Stimmen verfügbar", voices.len())),
+                    text("Bereit", BODY_SIZE, GREEN),
+                );
             }
-        }
-        self.confirm_delete = confirm;
-
-        if let Some((provider_id, package)) = start_download {
-            self.start_download(ui.ctx().clone(), provider_id, package);
-        }
-        if let Some((provider_id, package)) = delete {
-            self.confirm_delete = None;
-            self.speaker.stop();
-            if let Some(provider) = tts::provider(provider_id) {
-                if let Err(e) = provider.uninstall(&package) {
-                    self.message = Some(e);
-                }
+            let provider_id = provider.id();
+            for package in packages {
+                let key = format!("{provider_id}/{}", package.id);
+                let size = format!("{} MB", package.size_mb);
+                let package_id = package.id.clone();
+                let control: AnyElement = match downloads.get(&key) {
+                    Some(DownloadState::Running(progress)) => h_flex()
+                        .gap(px(8.0))
+                        .child(div().w(px(150.0)).child(Progress::new(SharedString::from(format!("dl-{key}"))).value(progress * 100.0)))
+                        .child(text(format!("{:.0} %", progress * 100.0), SMALL_SIZE, TEXT_WEAK))
+                        .into_any_element(),
+                    _ if package.installed => {
+                        if self.confirm_delete.as_deref() == Some(key.as_str()) {
+                            h_flex()
+                                .gap(px(8.0))
+                                .child(button(SharedString::from(format!("abbrechen-{key}")), "Abbrechen").on_click(
+                                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.confirm_delete = None;
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(danger_button(SharedString::from(format!("loeschen-{key}")), "Löschen").on_click(
+                                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.confirm_delete = None;
+                                        this.speaker.stop();
+                                        if let Some(provider) = tts::provider(provider_id) {
+                                            if let Err(e) = provider.uninstall(&package_id) {
+                                                this.message = Some(e);
+                                            }
+                                        }
+                                        this.refresh_catalog();
+                                        cx.notify();
+                                    }),
+                                ))
+                                .into_any_element()
+                        } else {
+                            let confirm_key = key.clone();
+                            h_flex()
+                                .gap(px(8.0))
+                                .child(text("Installiert", BODY_SIZE, GREEN))
+                                .child(button(SharedString::from(format!("frage-{key}")), "Löschen").on_click(cx.listener(
+                                    move |this, _: &ClickEvent, _, cx| {
+                                        this.confirm_delete = Some(confirm_key.clone());
+                                        cx.notify();
+                                    },
+                                )))
+                                .into_any_element()
+                        }
+                    }
+                    _ => primary_button(SharedString::from(format!("laden-{key}")), "Laden")
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.start_download(provider_id, package_id.clone());
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                };
+                group = group.row(package.name.clone(), Some(&size), control);
             }
-            self.refresh_catalog();
+            page = page.child(group);
         }
+        page
     }
 
-    fn start_download(&mut self, ctx: egui::Context, provider_id: &'static str, package: String) {
+    fn start_download(&mut self, provider_id: &'static str, package: String) {
         let key = format!("{provider_id}/{package}");
         let downloads = self.downloads.clone();
         downloads.lock().unwrap().insert(key.clone(), DownloadState::Running(0.0));
+        // Das Fenster fragt den Stand alle 200 ms ab.
         thread::spawn(move || {
             let Some(provider) = tts::provider(provider_id) else {
                 return;
@@ -524,435 +670,422 @@ impl SettingsApp {
                     .lock()
                     .unwrap()
                     .insert(key.clone(), DownloadState::Running(progress));
-                ctx.request_repaint();
             });
             let state = match result {
                 Ok(()) => DownloadState::Done,
                 Err(e) => DownloadState::Failed(e),
             };
             downloads.lock().unwrap().insert(key, state);
-            ctx.request_repaint();
         });
     }
 
-    fn pronunciation_tab(&mut self, ui: &mut egui::Ui) {
-        page_header(
-            ui,
-            "Aussprache",
-            "Wörter, die falsch ausgesprochen werden, so aufschreiben, wie sie klingen sollen. Gilt für alle Stimmen.",
-        );
-
-        let mut remove = None;
-        let mut play = None;
-        let mut add = false;
-        section(
-            ui,
-            None,
-            Some("Beispiel: „privat“ als „priwaht“. Groß- und Kleinschreibung spielt keine Rolle."),
-            |g| {
-                for (i, entry) in self.settings.pronunciations.iter_mut().enumerate() {
-                    g.custom(|ui| {
-                        ui.horizontal(|ui| {
-                            let field = ((ui.available_width() - 180.0) / 2.0).max(100.0);
-                            ui.add(
-                                egui::TextEdit::singleline(&mut entry.word)
-                                    .hint_text("Wort")
-                                    .desired_width(field),
-                            );
-                            let (rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::hover());
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "→",
-                                regular(13.0),
-                                TEXT_FAINT,
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut entry.spoken)
-                                    .hint_text("So sprechen")
-                                    .desired_width(field),
-                            );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Entfernen").clicked() {
-                                    remove = Some(i);
-                                }
-                                if ui.button("Anhören").clicked() {
-                                    play = Some(entry.word.clone());
-                                }
-                            });
-                        });
-                    });
-                }
-                if self.settings.pronunciations.is_empty() {
-                    g.row("Noch keine Einträge", None, |_| {});
-                }
-                g.custom(|ui| {
-                    if ui
-                        .add(egui::Button::new(RichText::new("+ Eintrag hinzufügen").color(ui_kit::ACCENT)).frame(false))
-                        .clicked()
-                    {
-                        add = true;
-                    }
-                });
-            },
-        );
-        if let Some(i) = remove {
-            self.settings.pronunciations.remove(i);
+    fn pronunciation_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pronunciation_rows.len() != self.settings.pronunciations.len() {
+            self.rebuild_pronunciation_rows(window, cx);
         }
-        if let Some(word) = play {
-            self.speak(&word);
-        }
-        if add {
-            self.settings.pronunciations.push(Pronunciation::default());
-        }
-    }
-
-    fn hotkeys_tab(&mut self, ui: &mut egui::Ui) {
-        page_header(ui, "Tastenkürzel", "Globale Tastenkürzel, die in jedem Programm funktionieren.");
-
-        if let Some(target) = self.capture {
-            if let Some(hotkey) = capture_hotkey(ui) {
-                match hotkey {
-                    Ok(hotkey) => {
-                        match target {
-                            HotkeyTarget::Speak => self.settings.hotkey_speak = hotkey,
-                            HotkeyTarget::Ocr => self.settings.hotkey_ocr = hotkey,
-                            HotkeyTarget::Snip => self.settings.hotkey_snip = hotkey,
+        let mut group =
+            section().footnote("Beispiel: „privat“ als „priwaht“. Groß- und Kleinschreibung spielt keine Rolle.");
+        for (i, row) in self.pronunciation_rows.iter().enumerate() {
+            group = group.child(custom(
+                h_flex()
+                    .gap(px(8.0))
+                    .child(div().flex_1().child(Input::new(&row.word)))
+                    .child(text("→", 13.0, TEXT_FAINT))
+                    .child(div().flex_1().child(Input::new(&row.spoken)))
+                    .child(button(("anhoeren", i), "Anhören").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if let Some(entry) = this.settings.pronunciations.get(i) {
+                            let word = entry.word.clone();
+                            this.speak(&word, cx);
                         }
-                        self.message = None;
-                        self.capture = None;
-                    }
-                    Err(Some(e)) => self.message = Some(e),
-                    Err(None) => self.capture = None,
-                }
-            }
-        }
-
-        let mut start_capture = None;
-        let capture = self.capture;
-        let rows = [
-            (HotkeyTarget::Speak, "Markierten Text vorlesen", "Nochmal drücken stoppt das Vorlesen.", self.settings.hotkey_speak.clone()),
-            (HotkeyTarget::Ocr, "Text aus Bildausschnitt kopieren", "Bereich auswählen, der Text landet in der Zwischenablage.", self.settings.hotkey_ocr.clone()),
-            (HotkeyTarget::Snip, "Screenshot aufnehmen", "Bereich, Fenster oder Bildschirm wählen, danach bearbeiten.", self.settings.hotkey_snip.clone()),
-        ];
-        section(
-            ui,
-            None,
-            Some("Kombinationen mit Strg und Alt eignen sich gut. Ist ein Kürzel schon von einem anderen Programm belegt, steht das im Fehlerprotokoll."),
-            |g| {
-                for (target, label, description, value) in &rows {
-                    g.row(label, Some(description), |ui| {
-                        if capture == Some(*target) {
-                            ui.label(RichText::new("Tasten drücken … (Esc bricht ab)").color(ui_kit::ACCENT));
-                        } else {
-                            if ui.button("Ändern").clicked() {
-                                start_capture = Some(*target);
+                    })))
+                    .child(button(("entfernen", i), "Entfernen").on_click(cx.listener(
+                        move |this, _: &ClickEvent, window, cx| {
+                            if i < this.settings.pronunciations.len() {
+                                this.settings.pronunciations.remove(i);
+                                this.rebuild_pronunciation_rows(window, cx);
+                                this.save(cx);
                             }
-                            keycaps(ui, &hotkey_label(value));
-                        }
-                    });
-                }
-            },
-        );
-        if let Some(target) = start_capture {
-            self.capture = Some(target);
-            self.message = None;
+                        },
+                    ))),
+            ));
         }
+        if self.settings.pronunciations.is_empty() {
+            group = group.row("Noch keine Einträge", None, div());
+        }
+        group = group.child(custom(
+            div()
+                .id("hinzufuegen")
+                .cursor_pointer()
+                .child(text("+ Eintrag hinzufügen", BODY_SIZE, ACCENT))
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.settings.pronunciations.push(Pronunciation::default());
+                    this.rebuild_pronunciation_rows(window, cx);
+                    this.save(cx);
+                })),
+        ));
+
+        v_flex()
+            .child(page_header(
+                "Aussprache",
+                "Wörter, die falsch ausgesprochen werden, so aufschreiben, wie sie klingen sollen. Gilt für alle Stimmen.",
+            ))
+            .child(group)
     }
 
-    fn screenshot_tab(&mut self, ui: &mut egui::Ui) {
-        page_header(
-            ui,
-            "Screenshot",
-            "Bildschirmausschnitte aufnehmen, beschriften, unkenntlich machen und teilen.",
+    fn hotkeys_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Während der Aufnahme bekommt die Seite die Tastendrücke.
+        if self.capture.is_some() && !self.focus.is_focused(window) {
+            window.focus(&self.focus, cx);
+        }
+        let rows = [
+            (HotkeyTarget::Speak, "Markierten Text vorlesen", "Nochmal drücken stoppt das Vorlesen.", &self.settings.hotkey_speak),
+            (HotkeyTarget::Ocr, "Text aus Bildausschnitt kopieren", "Bereich auswählen, der Text landet in der Zwischenablage.", &self.settings.hotkey_ocr),
+            (HotkeyTarget::Snip, "Screenshot aufnehmen", "Bereich, Fenster oder Bildschirm wählen, danach bearbeiten.", &self.settings.hotkey_snip),
+        ];
+        let mut group = section().footnote(
+            "Kombinationen mit Strg und Alt eignen sich gut. Ist ein Kürzel schon von einem anderen Programm belegt, steht das im Fehlerprotokoll.",
         );
+        for (i, (target, label, description, value)) in rows.into_iter().enumerate() {
+            let control: AnyElement = if self.capture == Some(target) {
+                text("Tasten drücken … (Esc bricht ab)", BODY_SIZE, ACCENT).into_any_element()
+            } else {
+                h_flex()
+                    .gap(px(8.0))
+                    .child(keycaps(&hotkey_label(value)))
+                    .child(button(("aendern", i), "Ändern").on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.capture = Some(target);
+                        this.message = None;
+                        window.focus(&this.focus, cx);
+                        cx.notify();
+                    })))
+                    .into_any_element()
+            };
+            group = group.row(label, Some(description), control);
+        }
+        v_flex()
+            .child(page_header("Tastenkürzel", "Globale Tastenkürzel, die in jedem Programm funktionieren."))
+            .child(group)
+    }
+
+    fn screenshot_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let spawn = |args: &[&str]| {
             if let Ok(exe) = std::env::current_exe() {
                 let _ = std::process::Command::new(exe).args(args).spawn();
             }
         };
+        let default_folder = crate::screenshot::default_folder();
+        let custom_folder = !self.settings.snip_folder.trim().is_empty();
+        let current = if custom_folder {
+            std::path::PathBuf::from(self.settings.snip_folder.trim())
+        } else {
+            default_folder.clone()
+        };
 
-        section(ui, Some("Nach der Aufnahme"), None, |g| {
-            g.row(
-                "Editor öffnen",
-                Some("Zum Beschriften, Zuschneiden und Unkenntlichmachen. Sonst erscheint nur ein Hinweis mit „Bearbeiten“."),
-                |ui| {
-                    toggle(ui, &mut self.settings.snip_open_editor);
-                },
-            );
-            g.row(
-                "In die Zwischenablage kopieren",
-                Some("Auch Änderungen im Editor landen automatisch dort – einfach mit Strg+V einfügen."),
-                |ui| {
-                    toggle(ui, &mut self.settings.snip_copy);
-                },
-            );
-            g.row("Automatisch speichern", Some("Jeden Screenshot als PNG im Ordner unten ablegen."), |ui| {
-                toggle(ui, &mut self.settings.snip_autosave);
-            });
-            let default_folder = crate::screenshot::default_folder();
-            g.custom(|ui| {
-                ui.label(RichText::new("Ordner für Screenshots").color(TEXT));
-                ui.label(
-                    RichText::new("Hier landen automatisch gespeicherte Screenshots; „Speichern unter“ im Editor schlägt ihn ebenfalls vor.")
-                        .font(regular(SMALL_SIZE))
-                        .color(TEXT_WEAK),
-                );
-                let custom = !self.settings.snip_folder.trim().is_empty();
-                let current = if custom {
-                    std::path::PathBuf::from(self.settings.snip_folder.trim())
-                } else {
-                    default_folder.clone()
-                };
-                ui.horizontal(|ui| {
-                    // Platz für die Knöpfe rechts lassen.
-                    let width = ui.available_width() - if custom { 260.0 } else { 175.0 };
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.settings.snip_folder)
-                            .hint_text(format!("{} (Standard)", default_folder.display()))
-                            .desired_width(width.max(120.0)),
-                    );
-                    if ui.button("Durchsuchen …").clicked() {
-                        if let Some(folder) = crate::screenshot::pick_folder(&current) {
-                            // Wieder den Standard gewählt: leer lassen, dann folgt er z. B. einem neuen Benutzerprofil.
-                            self.settings.snip_folder =
-                                if folder == default_folder { String::new() } else { folder.display().to_string() };
-                        }
-                    }
-                    if ui.button("Öffnen").on_hover_text("Ordner im Explorer anzeigen").clicked() {
-                        let _ = std::fs::create_dir_all(&current);
-                        let _ = std::process::Command::new("explorer").arg(&current).spawn();
-                    }
-                    if custom && ui.button("Standard").on_hover_text("Zurück zu Bilder\\Screenshots").clicked() {
-                        self.settings.snip_folder.clear();
-                    }
-                });
-            });
-        });
-
-        section(ui, Some("Explorer"), None, |g| {
-            g.row(
-                "„Mit UtilityCrab bearbeiten“ im Kontextmenü",
-                Some("Rechtsklick auf ein Bild öffnet es im Editor. Unter Windows 11 unter „Weitere Optionen anzeigen“."),
-                |ui| {
-                    toggle(ui, &mut self.settings.edit_context_menu);
-                },
-            );
-        });
-
-        section(
-            ui,
-            None,
-            Some(
-                "Im Editor: Stift, Textmarker, Pfeile, Formen, Text, Schrittnummern, Verpixeln/Weichzeichnen/Schwärzen, \
-                 Spotlight, Zuschneiden, Text erkennen, sensible Daten automatisch unkenntlich machen und Anheften.",
-            ),
-            |g| {
-                g.row("Screenshot aufnehmen", Some("Auch über das Tastenkürzel oder das Tray-Menü."), |ui| {
-                    if ui.button("In 5 Sekunden").clicked() {
-                        spawn(&[crate::screenshot::CAPTURE_ARG, crate::screenshot::Prefs::load().mode.id(), "5"]);
-                    }
-                    if ui.button("Jetzt").clicked() {
-                        spawn(&[crate::screenshot::CAPTURE_ARG, crate::screenshot::Prefs::load().mode.id(), "0"]);
-                    }
-                });
-                g.row("Vorhandenes Bild bearbeiten", Some("Öffnet den Editor; Bilder lassen sich auch hineinziehen."), |ui| {
-                    if ui.button("Editor öffnen").clicked() {
-                        spawn(&[crate::screenshot::EDIT_ARG]);
-                    }
-                });
-            },
-        );
-    }
-
-    fn convert_tab(&mut self, ui: &mut egui::Ui) {
-        page_header(ui, "Konvertieren", "Bilder in andere Formate umwandeln und Dateien verkleinern.");
-
-        section(ui, Some("Explorer"), None, |g| {
-            g.row(
-                "Im Kontextmenü anzeigen",
-                Some("Rechtsklick auf ein Bild → „Konvertieren“. Unter Windows 11 unter „Weitere Optionen anzeigen“."),
-                |ui| {
-                    toggle(ui, &mut self.settings.context_menu);
-                },
-            );
-        });
-
-        section(ui, Some("Wenn eine Konvertierung fertig ist"), None, |g| {
-            if g.choice(
-                "Popup unten in der Mitte",
-                Some("Mit Fortschritt in %, verschwindet nach ein paar Sekunden."),
-                self.settings.notify == Notify::Popup,
-            ) {
-                self.settings.notify = Notify::Popup;
-            }
-            if g.choice(
-                "Windows-Benachrichtigung",
-                Some("Unten rechts, bleibt im Benachrichtigungscenter."),
-                self.settings.notify == Notify::Windows,
-            ) {
-                self.settings.notify = Notify::Windows;
-            }
-        });
-
-        section(
-            ui,
-            None,
-            Some(
-                "Lesen: PNG, JPG, WebP, BMP, GIF, TIFF, ICO, HEIC und AVIF (dafür die „HEIF-Bilderweiterungen“ \
-                 bzw. „AV1 Video Extension“ aus dem Microsoft Store). Schreiben: PNG, JPG, WebP, BMP, GIF, TIFF, ICO.",
-            ),
-            |g| {
-                g.row("Konverter", Some("Mehrere Bilder mit allen Optionen umwandeln."), |ui| {
-                    if ui.button("Öffnen").clicked() {
-                        if let Ok(exe) = std::env::current_exe() {
-                            let _ = std::process::Command::new(exe)
-                                .args([crate::convert::CLI_ARG, "fenster"])
-                                .spawn();
-                        }
-                    }
-                });
-            },
-        );
-    }
-}
-
-impl SettingsApp {
-    fn about_tab(&mut self, ui: &mut egui::Ui) {
-        page_header(ui, "Info & Updates", "Version und Aktualisierungen.");
-
-        let state = self.update.lock().unwrap().clone();
-        let mut check = false;
-        let mut install = None;
-        section(ui, None, None, |g| {
-            g.row("Version", None, |ui| {
-                ui.label(RichText::new(update::display_version()).color(TEXT_WEAK));
-            });
-            g.row(
-                "Automatisch nach Updates suchen",
-                Some("Einmal täglich. Ein Update wird erst nach deiner Bestätigung installiert."),
-                |ui| {
-                    toggle(ui, &mut self.settings.auto_update);
-                },
-            );
-            let (label, description): (&str, Option<String>) = match &state {
-                UpdateState::Idle => ("Nach Updates suchen", None),
-                UpdateState::Checking => ("Suche läuft …", None),
-                UpdateState::Current => ("UtilityCrab ist aktuell", None),
-                UpdateState::Available(r) => ("Update verfügbar", Some(format!("Version {}", r.version))),
-                UpdateState::Failed(e) => ("Suche fehlgeschlagen", Some(e.clone())),
-            };
-            g.row(label, description.as_deref(), |ui| match &state {
-                UpdateState::Checking => {
-                    ui.add(egui::Spinner::new());
+        let browse = {
+            let current = current.clone();
+            let default_folder = default_folder.clone();
+            button("durchsuchen", "Durchsuchen …").on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                if let Some(folder) = crate::screenshot::pick_folder(&current) {
+                    // Wieder den Standard gewählt: leer lassen, dann folgt er z. B. einem neuen Benutzerprofil.
+                    let value = if folder == default_folder { String::new() } else { folder.display().to_string() };
+                    this.snip_folder.update(cx, |s, cx| s.set_value(value.clone(), window, cx));
+                    this.settings.snip_folder = value;
+                    this.save(cx);
                 }
-                UpdateState::Available(release) => {
-                    if ui.add(primary_button("Jetzt aktualisieren")).clicked() {
-                        install = Some(release.clone());
-                    }
-                    if !release.page_url.is_empty() && ui.button("Änderungen").clicked() {
-                        let _ = std::process::Command::new("explorer").arg(&release.page_url).spawn();
-                    }
-                }
-                _ => {
-                    if ui.button("Jetzt suchen").clicked() {
-                        check = true;
-                    }
-                }
-            });
+            }))
+        };
+        let open = {
+            let current = current.clone();
+            button("oeffnen", "Öffnen").tooltip("Ordner im Explorer anzeigen").on_click(move |_, _, _| {
+                let _ = std::fs::create_dir_all(&current);
+                let _ = std::process::Command::new("explorer").arg(&current).spawn();
+            })
+        };
+        let reset = custom_folder.then(|| {
+            button("standard", "Standard")
+                .tooltip("Zurück zu Bilder\\Screenshots")
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.snip_folder.update(cx, |s, cx| s.set_value("", window, cx));
+                    this.settings.snip_folder.clear();
+                    this.save(cx);
+                }))
         });
-        if update::release_version().is_none() {
-            ui.horizontal(|ui| {
-                ui.add_space(4.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(
-                            "Dies ist ein lokaler Build: Er sucht nicht automatisch nach Updates. \
-                             Installierte Versionen aus GitHub-Releases tun das.",
-                        )
-                        .font(regular(SMALL_SIZE))
-                        .color(TEXT_FAINT),
+
+        v_flex()
+            .child(page_header(
+                "Screenshot",
+                "Bildschirmausschnitte aufnehmen, beschriften, unkenntlich machen und teilen.",
+            ))
+            .child(
+                section()
+                    .title("Nach der Aufnahme")
+                    .row(
+                        "Editor öffnen",
+                        Some("Zum Beschriften, Zuschneiden und Unkenntlichmachen. Sonst erscheint nur ein Hinweis mit „Bearbeiten“."),
+                        self.switch("editor", self.settings.snip_open_editor, |s, v| s.snip_open_editor = v, cx),
                     )
-                    .wrap(),
-                );
-            });
-        }
+                    .row(
+                        "In die Zwischenablage kopieren",
+                        Some("Auch Änderungen im Editor landen automatisch dort – einfach mit Strg+V einfügen."),
+                        self.switch("kopieren", self.settings.snip_copy, |s, v| s.snip_copy = v, cx),
+                    )
+                    .row(
+                        "Automatisch speichern",
+                        Some("Jeden Screenshot als PNG im Ordner unten ablegen."),
+                        self.switch("autosave", self.settings.snip_autosave, |s, v| s.snip_autosave = v, cx),
+                    )
+                    .child(custom(
+                        v_flex()
+                            .gap(px(6.0))
+                            .child(
+                                v_flex().child(text("Ordner für Screenshots", BODY_SIZE, TEXT)).child(text(
+                                    "Hier landen automatisch gespeicherte Screenshots; „Speichern unter“ im Editor schlägt ihn ebenfalls vor.",
+                                    SMALL_SIZE,
+                                    TEXT_WEAK,
+                                )),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap(px(8.0))
+                                    .child(div().flex_1().min_w(px(120.0)).child(Input::new(&self.snip_folder)))
+                                    .child(browse)
+                                    .child(open)
+                                    .children(reset),
+                            ),
+                    )),
+            )
+            .child(
+                section().title("Explorer").row(
+                    "„Mit UtilityCrab bearbeiten“ im Kontextmenü",
+                    Some("Rechtsklick auf ein Bild öffnet es im Editor. Unter Windows 11 unter „Weitere Optionen anzeigen“."),
+                    self.switch("edit-kontextmenue", self.settings.edit_context_menu, |s, v| s.edit_context_menu = v, cx),
+                ),
+            )
+            .child(
+                section()
+                    .footnote(
+                        "Im Editor: Stift, Textmarker, Pfeile, Formen, Text, Schrittnummern, Verpixeln/Weichzeichnen/Schwärzen, \
+                         Spotlight, Zuschneiden, Text erkennen, sensible Daten automatisch unkenntlich machen und Anheften.",
+                    )
+                    .row(
+                        "Screenshot aufnehmen",
+                        Some("Auch über das Tastenkürzel oder das Tray-Menü."),
+                        h_flex()
+                            .gap(px(8.0))
+                            .child(button("in-5", "In 5 Sekunden").on_click(move |_, _, _| {
+                                spawn(&[crate::screenshot::CAPTURE_ARG, crate::screenshot::Prefs::load().mode.id(), "5"]);
+                            }))
+                            .child(button("jetzt", "Jetzt").on_click(move |_, _, _| {
+                                spawn(&[crate::screenshot::CAPTURE_ARG, crate::screenshot::Prefs::load().mode.id(), "0"]);
+                            })),
+                    )
+                    .row(
+                        "Vorhandenes Bild bearbeiten",
+                        Some("Öffnet den Editor; Bilder lassen sich auch hineinziehen."),
+                        button("editor-oeffnen", "Editor öffnen").on_click(move |_, _, _| spawn(&[crate::screenshot::EDIT_ARG])),
+                    ),
+            )
+    }
 
-        if check {
-            *self.update.lock().unwrap() = UpdateState::Checking;
-            let state = self.update.clone();
-            let ctx = ui.ctx().clone();
-            thread::spawn(move || {
-                let result = match update::check() {
-                    Ok(Some(release)) => UpdateState::Available(release),
-                    Ok(None) => UpdateState::Current,
-                    Err(e) => UpdateState::Failed(e),
-                };
-                *state.lock().unwrap() = result;
-                ctx.request_repaint();
-            });
-        }
-        if let Some(release) = install {
-            if let Ok(exe) = std::env::current_exe() {
-                let spawned = std::process::Command::new(exe)
-                    .args([update::INSTALL_ARG, &release.setup_url, &release.version])
-                    .spawn();
-                if let Err(e) = spawned {
-                    self.message = Some(format!("Update konnte nicht gestartet werden: {e}"));
-                }
+    fn convert_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let notify = self.settings.notify;
+        v_flex()
+            .child(page_header("Konvertieren", "Bilder in andere Formate umwandeln und Dateien verkleinern."))
+            .child(
+                section().title("Explorer").row(
+                    "Im Kontextmenü anzeigen",
+                    Some("Rechtsklick auf ein Bild → „Konvertieren“. Unter Windows 11 unter „Weitere Optionen anzeigen“."),
+                    self.switch("kontextmenue", self.settings.context_menu, |s, v| s.context_menu = v, cx),
+                ),
+            )
+            .child(
+                section()
+                    .title("Wenn eine Konvertierung fertig ist")
+                    .child(choice(
+                        "popup",
+                        "Popup unten in der Mitte",
+                        Some("Mit Fortschritt in %, verschwindet nach ein paar Sekunden."),
+                        notify == Notify::Popup,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.settings.notify = Notify::Popup;
+                            this.save(cx);
+                        }),
+                    ))
+                    .child(choice(
+                        "windows",
+                        "Windows-Benachrichtigung",
+                        Some("Unten rechts, bleibt im Benachrichtigungscenter."),
+                        notify == Notify::Windows,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.settings.notify = Notify::Windows;
+                            this.save(cx);
+                        }),
+                    )),
+            )
+            .child(
+                section()
+                    .footnote(
+                        "Lesen: PNG, JPG, WebP, BMP, GIF, TIFF, ICO, HEIC und AVIF (dafür die „HEIF-Bilderweiterungen“ \
+                         bzw. „AV1 Video Extension“ aus dem Microsoft Store). Schreiben: PNG, JPG, WebP, BMP, GIF, TIFF, ICO.",
+                    )
+                    .row(
+                        "Konverter",
+                        Some("Mehrere Bilder mit allen Optionen umwandeln."),
+                        button("konverter", "Öffnen").on_click(|_, _, _| {
+                            if let Ok(exe) = std::env::current_exe() {
+                                let _ = std::process::Command::new(exe)
+                                    .args([crate::convert::CLI_ARG, "fenster"])
+                                    .spawn();
+                            }
+                        }),
+                    ),
+            )
+    }
+
+    fn about_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.update.lock().unwrap().clone();
+        let (label, description): (&str, Option<String>) = match &state {
+            UpdateState::Idle => ("Nach Updates suchen", None),
+            UpdateState::Checking => ("Suche läuft …", None),
+            UpdateState::Current => ("UtilityCrab ist aktuell", None),
+            UpdateState::Available(r) => ("Update verfügbar", Some(format!("Version {}", r.version))),
+            UpdateState::Failed(e) => ("Suche fehlgeschlagen", Some(e.clone())),
+        };
+        let control: AnyElement = match &state {
+            UpdateState::Checking => Spinner::new().into_any_element(),
+            UpdateState::Available(release) => {
+                let install = release.clone();
+                let page_url = release.page_url.clone();
+                h_flex()
+                    .gap(px(8.0))
+                    .when(!page_url.is_empty(), |el| {
+                        el.child(button("aenderungen", "Änderungen").on_click(move |_, _, _| {
+                            let _ = std::process::Command::new("explorer").arg(&page_url).spawn();
+                        }))
+                    })
+                    .child(primary_button("aktualisieren", "Jetzt aktualisieren").on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            if let Ok(exe) = std::env::current_exe() {
+                                let spawned = std::process::Command::new(exe)
+                                    .args([update::INSTALL_ARG, &install.setup_url, &install.version])
+                                    .spawn();
+                                if let Err(e) = spawned {
+                                    this.message = Some(format!("Update konnte nicht gestartet werden: {e}"));
+                                    cx.notify();
+                                }
+                            }
+                        },
+                    )))
+                    .into_any_element()
             }
-        }
+            _ => button("suchen", "Jetzt suchen")
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    *this.update.lock().unwrap() = UpdateState::Checking;
+                    let state = this.update.clone();
+                    thread::spawn(move || {
+                        let result = match update::check() {
+                            Ok(Some(release)) => UpdateState::Available(release),
+                            Ok(None) => UpdateState::Current,
+                            Err(e) => UpdateState::Failed(e),
+                        };
+                        *state.lock().unwrap() = result;
+                    });
+                    cx.notify();
+                }))
+                .into_any_element(),
+        };
+
+        v_flex()
+            .child(page_header("Info & Updates", "Version und Aktualisierungen."))
+            .child(
+                section()
+                    .row("Version", None, text(update::display_version(), BODY_SIZE, TEXT_WEAK))
+                    .row(
+                        "Automatisch nach Updates suchen",
+                        Some("Einmal täglich. Ein Update wird erst nach deiner Bestätigung installiert."),
+                        self.switch("auto-update", self.settings.auto_update, |s, v| s.auto_update = v, cx),
+                    )
+                    .row(label, description.as_deref(), control),
+            )
+            .when(update::release_version().is_none(), |el| {
+                el.child(div().px(px(4.0)).child(text(
+                    "Dies ist ein lokaler Build: Er sucht nicht automatisch nach Updates. \
+                     Installierte Versionen aus GitHub-Releases tun das.",
+                    SMALL_SIZE,
+                    TEXT_FAINT,
+                )))
+            })
     }
 }
 
-/// Liest eine gedrückte Tastenkombination. `Err(None)` = abgebrochen.
-fn capture_hotkey(ui: &egui::Ui) -> Option<Result<String, Option<String>>> {
-    use egui::Key;
-    let (key, modifiers) = ui.input(|i| {
-        i.events.iter().find_map(|e| match e {
-            // Strg, Alt usw. allein sind noch keine Kombination – auf die eigentliche Taste warten.
-            egui::Event::Key {
-                key:
-                    Key::ShiftLeft
-                    | Key::ShiftRight
-                    | Key::ControlLeft
-                    | Key::ControlRight
-                    | Key::AltLeft
-                    | Key::AltRight
-                    | Key::SuperLeft
-                    | Key::SuperRight,
-                ..
-            } => None,
-            egui::Event::Key {
-                key,
-                pressed: true,
-                modifiers,
-                ..
-            } => Some((*key, *modifiers)),
-            _ => None,
-        })
-    })?;
-
-    if key == egui::Key::Escape {
+/// Liest eine gedrückte Tastenkombination. `None` = noch keine vollständige Kombination
+/// (z. B. nur Strg gedrückt), `Err(None)` = abgebrochen.
+fn capture_hotkey(keystroke: &Keystroke) -> Option<Result<String, Option<String>>> {
+    let key = keystroke.key.as_str();
+    // Strg, Alt usw. allein sind noch keine Kombination – auf die eigentliche Taste warten.
+    if matches!(key, "control" | "alt" | "shift" | "platform" | "function" | "fn" | "") {
+        return None;
+    }
+    if key == "escape" {
         return Some(Err(None));
     }
-    if !(modifiers.ctrl || modifiers.alt) {
+    let m = keystroke.modifiers;
+    if !(m.control || m.alt) {
         return Some(Err(Some("Bitte mit Strg und/oder Alt kombinieren.".into())));
     }
+    let name = key_name(key);
     let mut parts = Vec::new();
-    if modifiers.ctrl {
+    if m.control {
         parts.push("Ctrl");
     }
-    if modifiers.alt {
+    if m.alt {
         parts.push("Alt");
     }
-    if modifiers.shift {
+    if m.shift {
         parts.push("Shift");
     }
-    parts.push(key.name());
+    parts.push(&name);
     let hotkey = parts.join("+");
     if hotkey.parse::<HotKey>().is_err() {
-        return Some(Err(Some(format!("Die Taste „{}“ wird nicht unterstützt.", key.name()))));
+        return Some(Err(Some(format!("Die Taste „{name}“ wird nicht unterstützt."))));
     }
     Some(Ok(hotkey))
+}
+
+/// GPUI-Tastenname → Name, den `global_hotkey` versteht (und der lesbar ist).
+fn key_name(key: &str) -> String {
+    match key {
+        "up" => "ArrowUp".into(),
+        "down" => "ArrowDown".into(),
+        "left" => "ArrowLeft".into(),
+        "right" => "ArrowRight".into(),
+        "pageup" => "PageUp".into(),
+        "pagedown" => "PageDown".into(),
+        "backspace" => "Backspace".into(),
+        _ if key.chars().count() == 1 => key.to_uppercase(),
+        _ => {
+            let mut chars = key.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_name;
+    use global_hotkey::hotkey::HotKey;
+
+    #[test]
+    fn maps_gpui_key_names() {
+        assert_eq!(key_name("a"), "A");
+        assert_eq!(key_name("f5"), "F5");
+        assert_eq!(key_name("space"), "Space");
+        assert_eq!(key_name("up"), "ArrowUp");
+        for name in ["A", "F5", "Space", "ArrowUp", "PageDown", "Home", "Delete", "1"] {
+            assert!(format!("Ctrl+Alt+{name}").parse::<HotKey>().is_ok(), "{name}");
+        }
+    }
 }

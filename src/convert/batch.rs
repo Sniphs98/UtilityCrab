@@ -83,6 +83,14 @@ pub fn run(args: &[String]) {
         if queue.is_empty() {
             return;
         }
+        // GPUI läuft nur einmal pro Prozess: Hatte dieser Prozess schon ein Fenster, übernimmt
+        // ein frischer Prozess den Rest der Warteschlange.
+        if crate::ui_kit::has_run() {
+            if let Err(e) = crate::spawn_self(&[super::CLI_ARG, job.id()]) {
+                crate::report(Err(e));
+            }
+            return;
+        }
     }
 }
 

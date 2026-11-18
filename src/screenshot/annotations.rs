@@ -3,7 +3,7 @@
 //! verschieben. Neue Arten (z. B. Emoji, Lupe, Rahmen) brauchen nur ein neues `impl`
 //! und ein Werkzeug, das sie erzeugt – siehe `tools.rs`.
 
-use eframe::egui::{pos2, vec2, Color32, Pos2, Rect, Vec2};
+use crate::geom::{pos2, vec2, Color32, Pos2, Rect, Vec2};
 use serde::{Deserialize, Serialize};
 use tiny_skia::BlendMode;
 

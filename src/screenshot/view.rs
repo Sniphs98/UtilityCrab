@@ -1,6 +1,6 @@
 //! Umrechnung zwischen Bildpixeln und Bildschirmpunkten (Zoom und Verschiebung).
 
-use eframe::egui::{Pos2, Rect};
+use crate::geom::{Pos2, Rect};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct View {
