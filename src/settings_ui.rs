@@ -307,17 +307,14 @@ impl SettingsApp {
             return None;
         }
         let names = missing.join(" und ");
-        let hint = format!(
-            "Keine Windows-Stimme für {names} installiert. Solche Sätze werden mit der eingestellten Stimme gelesen. \
-             Unter „Zeit und Sprache > Sprachausgabe > Stimmen hinzufügen“ lässt sich eine nachinstallieren."
-        );
-        Some(
-            h_flex()
-                .gap(px(10.0))
-                .child(div().flex_1().child(text(hint, SMALL_SIZE, TEXT_WEAK)))
-                .child(button("stimmen-hinzufuegen", "Windows-Einstellungen öffnen").on_click(open_speech_settings()))
-                .into_any_element(),
-        )
+        Some(ui_kit::row(
+            format!("Keine Windows-Stimme für {names}"),
+            Some(
+                "Solche Sätze werden mit der eingestellten Stimme gelesen. Unter „Zeit und Sprache > \
+                 Sprachausgabe > Stimmen hinzufügen“ lässt sich eine nachinstallieren.",
+            ),
+            button("stimmen-hinzufuegen", "Windows-Einstellungen öffnen").on_click(open_speech_settings()),
+        ))
     }
 
     fn voices_of(&self, provider: &str) -> &[VoiceInfo] {
@@ -599,7 +596,7 @@ impl SettingsApp {
                         Some("Wechselt pro Satz zu einer installierten Stimme der erkannten Sprache, z. B. für einen englischen Satz."),
                         self.switch("auto-sprache", self.settings.auto_language, |s, v| s.auto_language = v, cx),
                     )
-                    .child_if_some(self.missing_windows_voices().map(custom)),
+                    .child_if_some(self.missing_windows_voices()),
             )
             .child(
                 section()
