@@ -23,9 +23,10 @@ pub fn download_all(files: &[FileSpec], progress: &mut dyn FnMut(f32)) -> Result
 
     for file in files {
         if !file.target.exists() {
-            download(file, &mut |bytes| {
-                progress((done + bytes.min(file.size)) as f32 / total as f32)
-            })?;
+            // Solange curl noch läuft, höchstens 99 %: Ist die angegebene Größe nur geschätzt
+            // (oder zu klein), stünde die Anzeige sonst schon lange vor dem Ende auf 100 %.
+            let cap = file.size.max(1) * 99 / 100;
+            download(file, &mut |bytes| progress((done + bytes.min(cap)) as f32 / total as f32))?;
         }
         done += file.size.max(1);
         progress(done as f32 / total as f32);

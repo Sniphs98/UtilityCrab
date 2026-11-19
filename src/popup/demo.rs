@@ -105,14 +105,41 @@ fn samples() -> Vec<(&'static str, Notice)> {
                 ))
                 .block(clipboard),
         ),
+        (
+            "update",
+            crate::update::available_notice(&crate::update::Release {
+                version: "0.1.0.13".into(),
+                setup_url: String::new(),
+                setup_size: 0,
+                page_url: String::new(),
+            }),
+        ),
+        ("update-laden", crate::update::downloading_notice("0.1.0.13", 0.64)),
+        ("update-voll", crate::update::downloading_notice("0.1.0.13", 1.0)),
+        ("update-installieren", crate::update::installing_notice("0.1.0.13")),
+        (
+            "update-fehler",
+            crate::update::failed("Das Setup konnte nicht geladen werden. Bitte später noch einmal versuchen."),
+        ),
+        ("update-aktuell", crate::update::check_notice(&Ok(None))),
+        (
+            "update-suche-fehler",
+            crate::update::check_notice(&Err("GitHub ist gerade nicht erreichbar.".into())),
+        ),
+        ("update-suche", Notice::new(Kind::Running, "Suche nach Updates …")),
     ]
+}
+
+/// Namen aller Beispiele, für die Fehlermeldung bei einem unbekannten Namen.
+fn names() -> String {
+    samples().iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
 }
 
 pub fn run(name: Option<&str>) {
     let all = samples();
     if let Some(name) = name {
         let Some((_, mut notice)) = all.into_iter().find(|(n, _)| *n == name) else {
-            eprintln!("Unbekannt. Möglich: lauf, klein, groesser, teilweise, optimal, fehler, text");
+            eprintln!("Unbekannt. Möglich: {}", names());
             return;
         };
         notice.timeout_secs = None;

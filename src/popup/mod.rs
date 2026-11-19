@@ -27,11 +27,14 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     DWM_WINDOW_CORNER_PREFERENCE,
 };
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::Foundation::RECT;
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
+    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::geom::vec2;
@@ -308,6 +311,10 @@ impl Render for Popup {
 }
 
 /// Setzt das Fenster unten mittig auf den Bildschirm mit dem Mauszeiger, knapp über die Taskleiste.
+///
+/// `size` ist die Größe des *Inhalts* (Client-Bereich). GPUI legt das Popup als Fenster mit
+/// (unsichtbarem) Rahmen an; ohne Ausgleich wäre der Inhalt um diesen Rahmen schmaler und
+/// rechts sowie unten abgeschnitten. Darum wird der Rahmen gemessen und dazugerechnet.
 fn place(hwnd: HWND, size: crate::geom::Vec2) {
     unsafe {
         let mut cursor = POINT::default();
@@ -320,15 +327,53 @@ fn place(hwnd: HWND, size: crate::geom::Vec2) {
         if !GetMonitorInfoW(monitor, &mut info).as_bool() {
             return;
         }
+        let work = info.rcWork;
         let (mut dpi_x, mut dpi_y) = (96, 96);
         let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
-        let scale = dpi_x as f32 / 96.0;
 
-        let work = info.rcWork;
+        // Erst auf den richtigen Bildschirm schieben: Hat der eine andere Skalierung, passt
+        // Windows (bzw. GPUI über WM_DPICHANGED) dabei die Fenstergröße an. Die endgültige
+        // Größe kommt danach, sonst würde sie gleich wieder überschrieben.
+        if GetDpiForWindow(hwnd) != dpi_x {
+            let rough_x = work.left + (work.right - work.left) / 2;
+            let rough_y = work.bottom - 1;
+            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), rough_x, rough_y, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE);
+        }
+
+        let dpi = match GetDpiForWindow(hwnd) {
+            0 => dpi_x,
+            d => d,
+        };
+        let scale = dpi as f32 / 96.0;
         let w = (size.x * scale).round() as i32;
         let h = (size.y * scale).round() as i32;
+
+        // Rahmen um den Client-Bereich (links/oben/rechts/unten) messen.
+        let (mut window, mut client) = (RECT::default(), RECT::default());
+        let mut origin = POINT::default();
+        let (inset_left, inset_top, extra_w, extra_h) = if GetWindowRect(hwnd, &mut window).is_ok()
+            && GetClientRect(hwnd, &mut client).is_ok()
+            && ClientToScreen(hwnd, &mut origin).as_bool()
+        {
+            let inset_left = (origin.x - window.left).max(0);
+            let inset_top = (origin.y - window.top).max(0);
+            let extra_w = ((window.right - window.left) - (client.right - client.left)).max(0);
+            let extra_h = ((window.bottom - window.top) - (client.bottom - client.top)).max(0);
+            (inset_left, inset_top, extra_w, extra_h)
+        } else {
+            (0, 0, 0, 0)
+        };
+
         let x = work.left + (work.right - work.left - w) / 2;
-        let y = work.bottom - h - (BOTTOM_GAP * scale) as i32;
-        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        let y = work.bottom - h - (BOTTOM_GAP * scale).round() as i32;
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            x - inset_left,
+            y - inset_top,
+            w + extra_w,
+            h + extra_h,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
     }
 }
