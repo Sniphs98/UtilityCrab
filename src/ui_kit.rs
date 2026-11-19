@@ -264,6 +264,14 @@ impl Section {
         self.rows.push(row.into_any_element());
         self
     }
+    /// Wie [`Section::child`], aber nur, wenn es die Zeile gibt.
+    pub fn child_if_some(self, row: Option<impl IntoElement>) -> Self {
+        match row {
+            Some(row) => self.child(row),
+            None => self,
+        }
+    }
+
     /// Zeile: Beschriftung (und Erklärung) links, Bedienelement rechtsbündig.
     pub fn row(self, label: impl Into<SharedString>, description: Option<&str>, control: impl IntoElement) -> Self {
         self.child(row(label, description, control))

@@ -139,6 +139,8 @@ struct SettingsApp {
     downloads: Downloads,
     /// Pakete und Stimmen je Provider; neu eingelesen nach Download oder Löschen.
     catalog: Vec<(&'static str, Vec<Package>, Vec<VoiceInfo>)>,
+    /// Sprachen der installierten Windows-Stimmen (z. B. „de-DE“).
+    windows_languages: Vec<String>,
     confirm_delete: Option<String>,
     capture: Option<HotkeyTarget>,
     message: Option<String>,
@@ -211,6 +213,7 @@ impl SettingsApp {
             speaker: tts::Speaker::new(),
             downloads: Downloads::default(),
             catalog: Vec::new(),
+            windows_languages: Vec::new(),
             confirm_delete: None,
             capture: None,
             message: None,
@@ -281,6 +284,40 @@ impl SettingsApp {
             .iter()
             .map(|p| (p.id(), p.packages(), p.voices()))
             .collect();
+        self.windows_languages = tts::windows_voice_languages();
+    }
+
+    /// Hinweis, wenn für die automatische Spracherkennung eine deutsche oder englische
+    /// Windows-Stimme fehlt – sonst liest z. B. die deutsche Stimme englische Sätze vor.
+    fn missing_windows_voices(&self) -> Option<AnyElement> {
+        if self.settings.provider != "windows" || !self.settings.auto_language {
+            return None;
+        }
+        let has = |lang: &str| {
+            self.windows_languages
+                .iter()
+                .any(|l| l.to_lowercase().starts_with(&format!("{lang}-")))
+        };
+        let missing: Vec<&str> = [("de", "Deutsch"), ("en", "Englisch")]
+            .into_iter()
+            .filter(|(lang, _)| !has(lang))
+            .map(|(_, name)| name)
+            .collect();
+        if missing.is_empty() {
+            return None;
+        }
+        let names = missing.join(" und ");
+        let hint = format!(
+            "Keine Windows-Stimme für {names} installiert. Solche Sätze werden mit der eingestellten Stimme gelesen. \
+             Unter „Zeit und Sprache > Sprachausgabe > Stimmen hinzufügen“ lässt sich eine nachinstallieren."
+        );
+        Some(
+            h_flex()
+                .gap(px(10.0))
+                .child(div().flex_1().child(text(hint, SMALL_SIZE, TEXT_WEAK)))
+                .child(button("stimmen-hinzufuegen", "Windows-Einstellungen öffnen").on_click(open_speech_settings()))
+                .into_any_element(),
+        )
     }
 
     fn voices_of(&self, provider: &str) -> &[VoiceInfo] {
@@ -561,7 +598,8 @@ impl SettingsApp {
                         "Sprache automatisch erkennen",
                         Some("Wechselt pro Satz zu einer installierten Stimme der erkannten Sprache, z. B. für einen englischen Satz."),
                         self.switch("auto-sprache", self.settings.auto_language, |s, v| s.auto_language = v, cx),
-                    ),
+                    )
+                    .child_if_some(self.missing_windows_voices().map(custom)),
             )
             .child(
                 section()
@@ -1086,6 +1124,15 @@ mod tests {
         assert_eq!(key_name("up"), "ArrowUp");
         for name in ["A", "F5", "Space", "ArrowUp", "PageDown", "Home", "Delete", "1"] {
             assert!(format!("Ctrl+Alt+{name}").parse::<HotKey>().is_ok(), "{name}");
+        }
+    }
+}
+
+/// Klick-Handler, der die Sprachausgabe-Seite der Windows-Einstellungen öffnet.
+fn open_speech_settings() -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    |_, _, _| {
+        if let Err(e) = std::process::Command::new("explorer").arg("ms-settings:speech").spawn() {
+            crate::log_error(&format!("Windows-Einstellungen konnten nicht geöffnet werden: {e}"));
         }
     }
 }

@@ -45,16 +45,7 @@ impl Provider for System {
 fn synthesize(text: &str, request: &Request) -> windows::core::Result<Audio> {
     let synth = SpeechSynthesizer::new()?;
     let voices: Vec<_> = SpeechSynthesizer::AllVoices()?.into_iter().collect();
-    let speaks = |v: &VoiceInformation, lang: &str| v.Language().is_ok_and(|l| l.to_string().starts_with(lang));
-    let selected = voices.iter().find(|v| v.Id().is_ok_and(|id| id == request.voice));
-    let voice = match request.lang {
-        // Passt die gewählte Stimme nicht zur erkannten Sprache, eine passende nehmen.
-        Some(lang) if request.auto_language && !selected.is_some_and(|v| speaks(v, lang)) => {
-            voices.iter().find(|v| speaks(v, lang)).or(selected)
-        }
-        _ => selected,
-    };
-    if let Some(voice) = voice {
+    if let Some(voice) = pick_voice(&voices, text, request) {
         synth.SetVoice(voice)?;
     }
     synth.Options()?.SetSpeakingRate(request.speed.clamp(0.5, 6.0) as f64)?;
@@ -68,6 +59,52 @@ fn synthesize(text: &str, request: &Request) -> windows::core::Result<Audio> {
     DataReader::FromBuffer(&buffer)?.ReadBytes(&mut wav)?;
 
     parse_wav(&wav).ok_or_else(|| windows::core::Error::new(windows::core::HRESULT(-1), "unbekanntes Audioformat"))
+}
+
+/// Sprachen (z. B. „de-DE“) der installierten Windows-Stimmen.
+pub fn voice_languages() -> Vec<String> {
+    let Ok(voices) = SpeechSynthesizer::AllVoices() else {
+        return Vec::new();
+    };
+    let mut langs: Vec<String> = voices.into_iter().filter_map(|v| Some(v.Language().ok()?.to_string())).collect();
+    langs.sort();
+    langs.dedup();
+    langs
+}
+
+/// Wählt die Stimme für einen Abschnitt.
+///
+/// Mit automatischer Spracherkennung wird zu einer Stimme der erkannten Sprache gewechselt,
+/// wenn die eingestellte sie nicht spricht – bevorzugt mit demselben Geschlecht, damit der
+/// Wechsel weniger auffällt. Gibt es für die erkannte Sprache keine Stimme (z. B. weil ein
+/// kurzer englischer Satz für Niederländisch gehalten wurde), wird nur noch zwischen Deutsch
+/// und Englisch entschieden.
+fn pick_voice<'a>(voices: &'a [VoiceInformation], text: &str, request: &Request) -> Option<&'a VoiceInformation> {
+    let selected = voices.iter().find(|v| v.Id().is_ok_and(|id| id == request.voice));
+    if !request.auto_language {
+        return selected;
+    }
+    let candidates = [request.lang, crate::lang::detect_german_or_english(text)];
+    let Some(lang) = candidates.into_iter().flatten().find(|lang| voices.iter().any(|v| speaks(v, lang))) else {
+        return selected;
+    };
+    if selected.is_some_and(|v| speaks(v, lang)) {
+        return selected;
+    }
+    let gender = selected.and_then(|v| v.Gender().ok());
+    let matching = || voices.iter().filter(|v| speaks(v, lang));
+    matching()
+        .find(|v| gender.is_some() && v.Gender().ok() == gender)
+        .or_else(|| matching().next())
+        .or(selected)
+}
+
+/// Spricht die Stimme die Sprache (ISO 639-1, z. B. „en“ passt zu „en-US“ und „en-GB“)?
+fn speaks(voice: &VoiceInformation, lang: &str) -> bool {
+    voice.Language().is_ok_and(|l| {
+        let l = l.to_string().to_lowercase();
+        l == lang || l.starts_with(&format!("{lang}-"))
+    })
 }
 
 /// Liest eine WAV-Datei mit 16-Bit-PCM; bei Stereo wird nur der erste Kanal benutzt.

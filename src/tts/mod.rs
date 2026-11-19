@@ -75,6 +75,11 @@ pub trait Provider: Send + Sync {
     fn synthesize(&self, text: &str, request: &Request) -> Result<Audio, String>;
 }
 
+/// Sprachen (z. B. „de-DE“) der installierten Windows-Stimmen.
+pub fn windows_voice_languages() -> Vec<String> {
+    system::voice_languages()
+}
+
 pub fn providers() -> &'static [Box<dyn Provider>] {
     static PROVIDERS: OnceLock<Vec<Box<dyn Provider>>> = OnceLock::new();
     PROVIDERS.get_or_init(|| {
