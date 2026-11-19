@@ -191,35 +191,58 @@ pub fn install(args: &[String]) {
         .map(|r| r.setup_size)
         .unwrap_or(40_000_000);
 
-    let downloading = |fraction: f32| {
-        Notice::new(Kind::Running, "Update wird geladen").block(Block::Progress {
-            fraction,
-            label: format!("UtilityCrab {version}"),
-        })
-    };
+    let downloading = |fraction: f32| downloading_notice(version, fraction);
     let result = popup::run(downloading(0.0), |handle| {
         let spec = FileSpec {
             url: url.clone(),
             target: target.clone(),
             size,
         };
-        let loaded = download_all(&[spec], &mut |p| handle.set(downloading(p)));
-        match loaded.and_then(|()| run_setup(&target)) {
-            Ok(()) => {
-                let mut done = Notice::new(Kind::Success, "Update wird installiert")
-                    .subtitle(format!("UtilityCrab {version} startet gleich neu."));
-                done.timeout_secs = Some(4.0);
-                handle.set(done);
-            }
-            Err(e) => {
-                crate::log_error(&format!("Update: {e}"));
-                handle.set(Notice::new(Kind::Error, "Update fehlgeschlagen").block(Block::Text(e)));
-            }
+        if let Err(e) = download_all(&[spec], &mut |p| handle.set(downloading(p))) {
+            crate::log_error(&format!("Update: {e}"));
+            handle.set(failed("Das Setup konnte nicht geladen werden. Bitte später noch einmal versuchen."));
+            return;
+        }
+        // Geladen: nicht bei „100 %“ mit Drehkreis stehen bleiben, sondern sagen, was jetzt passiert.
+        // Das Setup beendet gleich alle UtilityCrab-Prozesse, auch dieses Popup; darum erst kurz
+        // anzeigen und dann starten.
+        handle.set(installing_notice(version));
+        std::thread::sleep(Duration::from_millis(1200));
+        if let Err(e) = run_setup(&target) {
+            crate::log_error(&format!("Update: {e}"));
+            handle.set(failed("Das Setup konnte nicht gestartet werden."));
         }
     });
     if let Err((e, _)) = result {
         crate::log_error(&e);
     }
+}
+
+/// Fehler-Hinweis zum Update, mit Knopf zur Release-Seite zum Selbst-Herunterladen.
+pub fn failed(text: &str) -> Notice {
+    Notice::new(Kind::Error, "Update fehlgeschlagen")
+        .block(Block::Text(text.into()))
+        .action(Action::Open {
+            label: "Release-Seite öffnen".into(),
+            path: PathBuf::from(format!("https://github.com/{REPO}/releases/latest")),
+        })
+}
+
+/// Hinweis während des Ladens, `fraction` zwischen 0 und 1.
+pub fn downloading_notice(version: &str, fraction: f32) -> Notice {
+    Notice::new(Kind::Running, "Update wird geladen").block(Block::Progress {
+        fraction,
+        label: format!("UtilityCrab {version}"),
+    })
+}
+
+/// Hinweis, sobald das Setup geladen ist und gleich startet.
+pub fn installing_notice(version: &str) -> Notice {
+    let mut notice = Notice::new(Kind::Running, "Update wird installiert")
+        .subtitle(format!("UtilityCrab {version} startet danach automatisch neu."));
+    // Falls das Setup dieses Popup doch nicht beendet: nicht ewig offen bleiben.
+    notice.timeout_secs = Some(60.0);
+    notice
 }
 
 /// Startet das Setup ohne Rückfragen. Es beendet UtilityCrab (auch diesen Prozess) selbst.

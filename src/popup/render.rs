@@ -88,9 +88,11 @@ pub fn card(notice: &Notice, state: &CardState, cx: &mut Context<Popup>) -> Div 
     let timer = state.remaining.map(|r| r.clamp(0.0, 1.0));
     let timer_color = tint(kind_color(notice.kind), 0.5);
 
+    // Volle Fensterbreite statt fester Breite: Ist das Fenster (Rundung, Skalierung) ein paar
+    // Pixel schmaler, rutscht nichts über den Rand.
     v_flex()
         .relative()
-        .w(px(CARD_WIDTH))
+        .w_full()
         .bg(CARD_BG)
         .pl(px(PAD_X))
         .pr(px(PAD_X - 4.0))
@@ -114,7 +116,7 @@ pub fn card(notice: &Notice, state: &CardState, cx: &mut Context<Popup>) -> Div 
                     .left_0()
                     .bottom_0()
                     .h(px(2.0))
-                    .w(px(CARD_WIDTH * remaining))
+                    .w(relative(remaining))
                     .bg(timer_color),
             )
         })
@@ -161,7 +163,7 @@ fn header(notice: &Notice, trailing: Option<Trailing>, state: &CardState, cx: &m
                 .flex_none()
                 .ml(px(6.0))
                 .pt(px(first_line + 1.0))
-                .child(regular(format!("{:.0} %", state.shown_fraction * 100.0), SMALL_SIZE, TEXT_WEAK)),
+                .child(regular(percent(state.shown_fraction), SMALL_SIZE, TEXT_WEAK)),
         ),
         None => None,
     };
@@ -288,6 +290,11 @@ fn footer(notice: &Notice, chips: Vec<(Icon, String)>, cx: &mut Context<Popup>) 
         }))
 }
 
+/// Abgerundete Prozentzahl: „100 %“ erst, wenn wirklich alles fertig ist (nicht schon bei 99,6 %).
+fn percent(fraction: f32) -> String {
+    format!("{} %", (fraction.clamp(0.0, 1.0) * 100.0 + 1e-3).floor() as u32)
+}
+
 /// Kürzt auf höchstens `lines` Zeilen und `chars` Zeichen, mit „…“.
 fn shorten(text: &str, lines: usize, chars: usize) -> String {
     let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -301,4 +308,18 @@ fn shorten(text: &str, lines: usize, chars: usize) -> String {
         out.push('…');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent;
+
+    #[test]
+    fn percent_rounds_down_until_done() {
+        assert_eq!(percent(0.0), "0 %");
+        assert_eq!(percent(0.996), "99 %");
+        assert_eq!(percent(1.0), "100 %");
+        assert_eq!(percent(0.58), "58 %");
+        assert_eq!(percent(1.4), "100 %");
+    }
 }
