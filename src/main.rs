@@ -9,6 +9,7 @@ mod geom;
 mod icon;
 mod lang;
 mod ocr;
+mod playback;
 mod popup;
 mod screenshot;
 mod settings;
@@ -26,6 +27,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
@@ -66,6 +68,8 @@ enum Command {
     OpenLog,
     /// Von Hand nach Updates suchen.
     CheckUpdate,
+    /// Knopfdruck in der Schnellsteuerung fürs Vorlesen.
+    Playback(playback::Control),
     Quit,
 }
 
@@ -83,6 +87,7 @@ fn main() {
         Some(SETTINGS_ARG) => return settings_ui::run(args.get(1).map(String::as_str)),
         Some(convert::CLI_ARG) => return convert::batch::run(&args[1..]),
         Some(popup::remote::ARG) => return popup::remote::serve(),
+        Some(playback::ARG) => return playback::serve(),
         Some(update::INSTALL_ARG) => return update::install(&args[1..]),
         Some(update::CHECK_ARG) => return update::check_now(),
         Some(screenshot::CAPTURE_ARG) => return screenshot::run_capture(&args[1..]),
@@ -100,7 +105,8 @@ fn main() {
     let main_thread = unsafe { GetCurrentThreadId() };
     let (tx, rx) = mpsc::channel::<Command>();
 
-    let worker = thread::spawn(move || worker_loop(rx, main_thread));
+    let worker_tx = tx.clone();
+    let worker = thread::spawn(move || worker_loop(rx, worker_tx, main_thread));
 
     // --- Globale Shortcuts -------------------------------------------------
     let mut settings = Settings::load();
@@ -264,21 +270,131 @@ fn update_labels(settings: &Settings, tray: &TrayIcon, speak_item: &MenuItem, sn
     )));
 }
 
-fn worker_loop(rx: mpsc::Receiver<Command>, main_thread: u32) {
+/// Die Schnellsteuerung fürs Vorlesen aus Sicht des Worker-Threads.
+struct PlaybackOverlay {
+    tx: mpsc::Sender<Command>,
+    enabled: bool,
+    window: Option<playback::Overlay>,
+    /// Für dieses Vorlesen ausgeblendet (✕); gilt bis zum nächsten Vorlesen.
+    hidden: bool,
+}
+
+impl PlaybackOverlay {
+    fn new(tx: mpsc::Sender<Command>, enabled: bool) -> Self {
+        Self {
+            tx,
+            enabled,
+            window: None,
+            hidden: false,
+        }
+    }
+
+    /// Ein neues Vorlesen hat begonnen.
+    fn started(&mut self) {
+        self.hidden = false;
+    }
+
+    /// Öffnet, aktualisiert oder schließt die Karte passend zum Zustand des Sprechers.
+    fn sync(&mut self, speaker: &tts::Speaker, text: Option<&str>) {
+        if self.window.as_mut().is_some_and(|w| !w.is_running()) {
+            self.window = None;
+        }
+        if !self.enabled || self.hidden || !speaker.is_speaking() {
+            // stdin schließen: Die Karte verschwindet von selbst.
+            self.window = None;
+            return;
+        }
+        let volume = speaker.volume();
+        let state = playback::State {
+            paused: speaker.is_paused(),
+            volume: volume.level,
+            muted: volume.muted,
+            text: text.map(playback::excerpt).unwrap_or_default(),
+        };
+        if self.window.is_none() {
+            let tx = self.tx.clone();
+            match playback::Overlay::spawn(move |control| {
+                let _ = tx.send(Command::Playback(control));
+            }) {
+                Ok(window) => self.window = Some(window),
+                Err(e) => {
+                    log_error(&e);
+                    // Nicht bei jedem Takt erneut versuchen.
+                    self.hidden = true;
+                    return;
+                }
+            }
+        }
+        if let Some(window) = &mut self.window {
+            if let Err(e) = window.set(&state) {
+                log_error(&e);
+                self.window = None;
+            }
+        }
+    }
+}
+
+fn worker_loop(rx: mpsc::Receiver<Command>, tx: mpsc::Sender<Command>, main_thread: u32) {
     let mut speaker = tts::Speaker::new();
     // Zuletzt vorgelesener Text, um „neuer Text markiert“ von „stoppen“ zu unterscheiden.
     let mut last_text: Option<String> = None;
     let mut settings_window: Option<Child> = None;
     let mut capture_window: Option<Child> = None;
     let settings = Settings::load();
+    let mut overlay = PlaybackOverlay::new(tx, settings.playback_overlay);
     tts::preload(&settings);
     // Bei jedem Start eintragen, damit der Programmpfad nach einem Update stimmt.
     report(shell_menu::sync(&settings));
     update::spawn_background_checks(|| Settings::load().auto_update);
 
-    for cmd in rx {
+    loop {
+        // Während vorgelesen wird, regelmäßig die Schnellsteuerung abgleichen
+        // (Ende der Wiedergabe, Pause per Tastenkürzel …); sonst einfach warten.
+        let active = speaker.is_speaking() || overlay.window.is_some();
+        let cmd = if active {
+            match rx.recv_timeout(Duration::from_millis(150)) {
+                Ok(cmd) => Some(cmd),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(cmd) => Some(cmd),
+                Err(_) => break,
+            }
+        };
+        let Some(cmd) = cmd else {
+            overlay.sync(&speaker, last_text.as_deref());
+            continue;
+        };
         let result = match cmd {
-            Command::SpeakSelection => speak_selection(&mut speaker, &mut last_text),
+            Command::SpeakSelection => {
+                let result = speak_selection(&mut speaker, &mut last_text);
+                if speaker.is_speaking() {
+                    overlay.started();
+                }
+                result
+            }
+            Command::Playback(control) => match control {
+                playback::Control::TogglePause => speaker.toggle_pause(),
+                playback::Control::Stop => {
+                    speaker.stop();
+                    Ok(())
+                }
+                playback::Control::SetVolume(level) => {
+                    speaker.set_volume(settings::Volume { level, ..speaker.volume() });
+                    Ok(())
+                }
+                playback::Control::SetMuted(muted) => {
+                    speaker.set_volume(settings::Volume { muted, ..speaker.volume() });
+                    Ok(())
+                }
+                playback::Control::OpenSettings => open_settings(&mut settings_window),
+                playback::Control::Hide => {
+                    overlay.hidden = true;
+                    Ok(())
+                }
+            },
             Command::OcrSnip => spawn_ocr(ocr::snip_to_clipboard),
             Command::OcrClipboard => spawn_ocr(ocr::clipboard_image_to_clipboard),
             Command::Snip(delay) => start_capture(&mut capture_window, delay),
@@ -293,6 +409,7 @@ fn worker_loop(rx: mpsc::Receiver<Command>, main_thread: u32) {
             Command::OpenConverter => spawn_self(&[convert::CLI_ARG, "fenster"]).map(|_| ()),
             Command::SettingsChanged => {
                 let settings = Settings::load();
+                overlay.enabled = settings.playback_overlay;
                 tts::preload(&settings);
                 shell_menu::sync(&settings)
             }
@@ -310,6 +427,7 @@ fn worker_loop(rx: mpsc::Receiver<Command>, main_thread: u32) {
             }
         };
         report(result);
+        overlay.sync(&speaker, last_text.as_deref());
     }
 }
 

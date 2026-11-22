@@ -5,7 +5,7 @@ mod supertonic;
 mod system;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use windows::core::{Interface, HSTRING};
@@ -13,7 +13,7 @@ use windows::Media::Core::MediaSource;
 use windows::Media::Playback::{MediaPlaybackItem, MediaPlaybackList, MediaPlaybackState, MediaPlayer};
 use windows::Storage::Streams::{DataWriter, IRandomAccessStream, InMemoryRandomAccessStream};
 
-use crate::settings::{Pronunciation, Settings};
+use crate::settings::{Pronunciation, Settings, Volume};
 
 /// Ein herunterladbares Paket eines Providers (z. B. ein Modell oder eine Stimme).
 pub struct Package {
@@ -130,17 +130,65 @@ pub fn preload(settings: &Settings) {
 struct Job {
     cancel: AtomicBool,
     done: AtomicBool,
+    /// Vom Benutzer angehalten. Hinter einem Mutex, damit der Synthese-Thread nicht genau
+    /// zwischen Prüfen und `Play()` eine Pause überholt.
+    paused: Mutex<bool>,
 }
 
 /// Liest Text vor: Abschnitte werden im Hintergrund berechnet und abgespielt, sobald sie fertig sind.
 pub struct Speaker {
     player: Option<MediaPlayer>,
     job: Option<Arc<Job>>,
+    volume: Volume,
 }
 
 impl Speaker {
     pub fn new() -> Self {
-        Self { player: None, job: None }
+        Self {
+            player: None,
+            job: None,
+            volume: Volume::load(),
+        }
+    }
+
+    pub fn volume(&self) -> Volume {
+        self.volume
+    }
+
+    /// Ändert Lautstärke bzw. Stummschaltung sofort und merkt sie sich für später.
+    pub fn set_volume(&mut self, volume: Volume) {
+        let volume = Volume {
+            level: volume.level.clamp(0.0, 1.0),
+            ..volume
+        };
+        if volume == self.volume {
+            return;
+        }
+        self.volume = volume;
+        if let Some(player) = &self.player {
+            apply_volume(player, volume);
+        }
+        volume.save();
+    }
+
+    /// Angehalten (die Wiedergabe läuft weiter, sobald sie fortgesetzt wird).
+    pub fn is_paused(&self) -> bool {
+        self.player.is_some() && self.job.as_ref().is_some_and(|job| *job.paused.lock().unwrap())
+    }
+
+    /// Hält das Vorlesen an bzw. setzt es fort. Ohne laufende Wiedergabe passiert nichts.
+    pub fn toggle_pause(&mut self) -> Result<(), String> {
+        let (Some(player), Some(job)) = (&self.player, &self.job) else {
+            return Ok(());
+        };
+        let mut paused = job.paused.lock().unwrap();
+        *paused = !*paused;
+        if *paused {
+            player.Pause()
+        } else {
+            resume(player)
+        }
+        .map_err(|e| format!("Wiedergabe: {e}"))
     }
 
     pub fn speak(&mut self, text: &str, settings: &Settings) -> Result<(), String> {
@@ -152,6 +200,7 @@ impl Speaker {
         let list = MediaPlaybackList::new().map_err(|e| format!("Wiedergabe: {e}"))?;
         let player = MediaPlayer::new().map_err(|e| format!("Wiedergabe: {e}"))?;
         player.SetSource(&list).map_err(|e| format!("Wiedergabe: {e}"))?;
+        apply_volume(&player, self.volume);
 
         let job = Arc::new(Job::default());
         let (thread_job, thread_player) = (job.clone(), player.clone());
@@ -175,7 +224,11 @@ impl Speaker {
         Ok(())
     }
 
+    /// Läuft noch (auch angehalten oder während der nächste Abschnitt berechnet wird).
     pub fn is_speaking(&self) -> bool {
+        if self.is_paused() {
+            return true;
+        }
         let synthesizing = self.job.as_ref().is_some_and(|job| !job.done.load(Ordering::SeqCst));
         synthesizing
             || self
@@ -234,7 +287,7 @@ fn stream(
         if job.cancel.load(Ordering::SeqCst) {
             break;
         }
-        if let Err(e) = enqueue(&samples, audio.sample_rate, list, player) {
+        if let Err(e) = enqueue(&samples, audio.sample_rate, list, player, job) {
             // Nach einem Stopp ist der Player schon geschlossen – das ist kein Fehler.
             if job.cancel.load(Ordering::SeqCst) {
                 break;
@@ -251,13 +304,18 @@ fn enqueue(
     sample_rate: u32,
     list: &MediaPlaybackList,
     player: &MediaPlayer,
+    job: &Job,
 ) -> windows::core::Result<()> {
     let source = MediaSource::CreateFromStream(&wav_stream(samples, sample_rate)?, &HSTRING::from("audio/wav"))?;
     let items = list.Items()?;
+    // Während des Anhängens darf niemand pausieren oder fortsetzen.
+    let paused = job.paused.lock().unwrap();
     items.Append(&MediaPlaybackItem::Create(&source)?)?;
 
     let index = items.Size()? - 1;
-    if index == 0 {
+    if *paused {
+        // Vom Benutzer angehalten: Der Abschnitt wartet, bis fortgesetzt wird.
+    } else if index == 0 {
         player.Play()?;
     } else if player.PlaybackSession()?.PlaybackState()? == MediaPlaybackState::Paused {
         // Die Wiedergabe war schneller als die Berechnung und ist am Ende stehen geblieben.
@@ -265,6 +323,26 @@ fn enqueue(
         player.Play()?;
     }
     Ok(())
+}
+
+fn apply_volume(player: &MediaPlayer, volume: Volume) {
+    let _ = player.SetVolume(volume.level as f64);
+    let _ = player.SetIsMuted(volume.muted);
+}
+
+/// Setzt nach einer Pause fort. Ist die Wiedergabe in der Pause bis ans Ende der bisher
+/// fertigen Abschnitte gekommen und inzwischen ein neuer dazugekommen, geht es mit dem weiter.
+fn resume(player: &MediaPlayer) -> windows::core::Result<()> {
+    if let Ok(list) = player.Source().and_then(|s| s.cast::<MediaPlaybackList>()) {
+        let session = player.PlaybackSession()?;
+        let at_end = session.NaturalDuration()?.Duration > 0
+            && session.Position()?.Duration >= session.NaturalDuration()?.Duration;
+        let (current, count) = (list.CurrentItemIndex()?, list.Items()?.Size()?);
+        if at_end && current + 1 < count {
+            list.MoveTo(current + 1)?;
+        }
+    }
+    player.Play()
 }
 
 /// Ersetzt Wörter aus dem Aussprache-Wörterbuch (ganze Wörter, Groß-/Kleinschreibung egal).

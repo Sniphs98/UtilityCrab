@@ -38,6 +38,8 @@ pub struct Settings {
     pub snip_folder: String,
     /// Eintrag „Mit UtilityCrab bearbeiten“ im Explorer-Kontextmenü von Bildern.
     pub edit_context_menu: bool,
+    /// Beim Vorlesen eine kleine Steuerung (Pause, Lautstärke, Stumm) einblenden.
+    pub playback_overlay: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -74,6 +76,7 @@ impl Default for Settings {
             snip_autosave: false,
             snip_folder: String::new(),
             edit_context_menu: true,
+            playback_overlay: true,
         }
     }
 }
@@ -143,4 +146,42 @@ pub fn hotkey_label(hotkey: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("+")
+}
+
+/// Lautstärke der Sprachausgabe. Eigene Datei, weil sie die Schnellsteuerung im Tray-Prozess
+/// ändert, während der Einstellungsdialog seine eigene Kopie von [`Settings`] speichert.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Volume {
+    /// 0.0 bis 1.0.
+    pub level: f32,
+    pub muted: bool,
+}
+
+impl Default for Volume {
+    fn default() -> Self {
+        Self { level: 1.0, muted: false }
+    }
+}
+
+impl Volume {
+    fn path() -> PathBuf {
+        crate::data_dir().join("lautstaerke.json")
+    }
+
+    pub fn load() -> Self {
+        let mut volume: Self = fs::read_to_string(Self::path())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        volume.level = volume.level.clamp(0.0, 1.0);
+        volume
+    }
+
+    pub fn save(&self) {
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = fs::create_dir_all(crate::data_dir());
+            let _ = fs::write(Self::path(), json);
+        }
+    }
 }
