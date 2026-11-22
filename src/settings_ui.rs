@@ -596,6 +596,11 @@ impl SettingsApp {
                         Some("Wechselt pro Satz zu einer installierten Stimme der erkannten Sprache, z. B. für einen englischen Satz."),
                         self.switch("auto-sprache", self.settings.auto_language, |s, v| s.auto_language = v, cx),
                     )
+                    .row(
+                        "Schnellsteuerung beim Vorlesen",
+                        Some("Kleine Karte unten rechts mit Pause, Stopp, Lautstärke und Stumm. Nur sichtbar, solange vorgelesen wird."),
+                        self.switch("schnellsteuerung", self.settings.playback_overlay, |s, v| s.playback_overlay = v, cx),
+                    )
                     .child_if_some(self.missing_windows_voices()),
             )
             .child(

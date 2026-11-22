@@ -13,7 +13,7 @@ mod icons;
 mod model;
 pub mod remote;
 mod render;
-mod theme;
+pub(crate) mod theme;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -39,6 +39,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::geom::vec2;
 pub use model::{Action, Block, Icon, Kind, Notice, Tone};
+pub(crate) use icons::cross as icons_cross;
 use theme::{BOTTOM_GAP, CARD_WIDTH};
 
 struct Shared {
@@ -146,7 +147,7 @@ pub fn show(handle: &Handle) -> Result<(), String> {
 
 /// Klicks aktivieren das Fenster nicht (man kann einfach weitertippen); Windows 11 zeichnet
 /// runde Ecken, Schatten und einen dezenten Rahmen in Kartenfarbe.
-fn style_window(hwnd: HWND) {
+pub(crate) fn style_window(hwnd: HWND) {
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize);
@@ -247,7 +248,7 @@ impl Popup {
         let height = self.measured_height.get().ceil();
         if let Some(hwnd) = self.hwnd {
             if height > 0.0 && self.placed_height.is_none_or(|h| (h - height).abs() > 0.5) {
-                place(hwnd, vec2(CARD_WIDTH, height));
+                place(hwnd, vec2(CARD_WIDTH, height), Anchor::BottomCenter);
                 self.placed_height = Some(height);
             }
         }
@@ -310,12 +311,21 @@ impl Render for Popup {
     }
 }
 
-/// Setzt das Fenster unten mittig auf den Bildschirm mit dem Mauszeiger, knapp über die Taskleiste.
+/// Wo ein Popup-Fenster sitzt (jeweils knapp über der Taskleiste).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Anchor {
+    /// Unten mittig – Hinweise.
+    BottomCenter,
+    /// Unten rechts – die Schnellsteuerung fürs Vorlesen, damit Hinweise sie nicht verdecken.
+    BottomRight,
+}
+
+/// Setzt das Fenster auf den Bildschirm mit dem Mauszeiger, knapp über die Taskleiste.
 ///
 /// `size` ist die Größe des *Inhalts* (Client-Bereich). GPUI legt das Popup als Fenster mit
 /// (unsichtbarem) Rahmen an; ohne Ausgleich wäre der Inhalt um diesen Rahmen schmaler und
 /// rechts sowie unten abgeschnitten. Darum wird der Rahmen gemessen und dazugerechnet.
-fn place(hwnd: HWND, size: crate::geom::Vec2) {
+pub(crate) fn place(hwnd: HWND, size: crate::geom::Vec2, anchor: Anchor) {
     unsafe {
         let mut cursor = POINT::default();
         let _ = GetCursorPos(&mut cursor);
@@ -364,8 +374,12 @@ fn place(hwnd: HWND, size: crate::geom::Vec2) {
             (0, 0, 0, 0)
         };
 
-        let x = work.left + (work.right - work.left - w) / 2;
-        let y = work.bottom - h - (BOTTOM_GAP * scale).round() as i32;
+        let gap = (BOTTOM_GAP * scale).round() as i32;
+        let x = match anchor {
+            Anchor::BottomCenter => work.left + (work.right - work.left - w) / 2,
+            Anchor::BottomRight => work.right - w - gap,
+        };
+        let y = work.bottom - h - gap;
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
